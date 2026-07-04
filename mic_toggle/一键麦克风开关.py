@@ -21,7 +21,6 @@ MUTEX_NAME = "Global\\MicToggleHotkeySingleInstance"
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
-WS_EX_LAYERED = 0x00080000
 WS_EX_TOOLWINDOW = 0x00000080
 
 CLSCTX_ALL = 23
@@ -188,9 +187,10 @@ def set_window_click_through(hwnd: int) -> None:
     """Make a Windows Tk top-level window ignore mouse input.
 
     WS_EX_TRANSPARENT makes hit-testing fall through to windows below it, so the
-    overlay does not block games or other full-screen applications. WS_EX_LAYERED
-    keeps alpha transparency working, and WS_EX_TOOLWINDOW keeps the tiny overlay
-    out of Alt-Tab/taskbar style surfaces.
+    overlay does not block games or other full-screen applications. Do not set
+    WS_EX_LAYERED here: Tk already owns the layered-window state when
+    root.attributes("-alpha", ...) is used, and forcing the flag here can corrupt
+    Tk's painting on Windows.
     """
 
     if os.name != "nt" or not hwnd:
@@ -207,7 +207,7 @@ def set_window_click_through(hwnd: int) -> None:
     set_style.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
     set_style.restype = ctypes.c_void_p
     style = int(get_style(wintypes.HWND(hwnd), GWL_EXSTYLE) or 0)
-    style |= WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW
+    style |= WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
     set_style(wintypes.HWND(hwnd), GWL_EXSTYLE, ctypes.c_void_p(style))
 
 
