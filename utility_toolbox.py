@@ -1541,6 +1541,11 @@ class LiveShortcutTab:
 
 
 class SystemToolsTab:
+    MIC_TOGGLE_NAMES = {
+        "一键麦克风开关.exe",
+        "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
+    }
+
     def __init__(self, parent: tk.Widget, status_callback: Callable[[str], None]):
         self.parent = parent
         self.status_callback = status_callback
@@ -1558,6 +1563,11 @@ class SystemToolsTab:
             text="启动麦克风悬浮窗",
             command=self.open_mic_toggle,
         ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
+        ttk.Button(
+            frame,
+            text="关闭麦克风悬浮窗",
+            command=self.close_mic_toggle,
+        ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
 
     def open_admin_powershell(self) -> None:
         try:
@@ -1569,22 +1579,14 @@ class SystemToolsTab:
             messagebox.showerror("启动失败", f"无法以管理员身份启动 Windows PowerShell：{exc}")
 
     def open_mic_toggle(self) -> None:
-        for process in self._running_processes():
-            if process.lower() == "一键麦克风开关.exe":
-                self.status_callback("麦克风悬浮窗已在运行")
-                return
+        if self._running_mic_processes():
+            self.status_callback("麦克风悬浮窗已在运行")
+            return
         if getattr(sys, "frozen", False):
             app_dir = Path(sys.executable).resolve().parent
         else:
             app_dir = Path(__file__).resolve().parent
-        candidates = [
-            app_dir / "一键麦克风开关.exe",
-            app_dir / "mic_tool_workspace" / "dist" / "一键麦克风开关.exe",
-            app_dir / "mic_tool_workspace" / "dist" / "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
-            Path.home() / "Documents" / "工具箱" / "mic_tool_workspace" / "dist" / "一键麦克风开关.exe",
-            Path.home() / "Documents" / "工具箱" / "mic_tool_workspace" / "dist" / "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
-        ]
-        executable = next((path for path in candidates if path.exists()), None)
+        executable = next((path for path in self._mic_toggle_candidates(app_dir) if path.exists()), None)
         if executable is None:
             messagebox.showerror("启动失败", "找不到一键麦克风开关.exe，请先生成麦克风悬浮窗工具。")
             return
@@ -1593,6 +1595,103 @@ class SystemToolsTab:
             self.status_callback("已启动麦克风悬浮窗")
         except Exception as exc:
             messagebox.showerror("启动失败", f"无法启动麦克风悬浮窗：{exc}")
+
+    def close_mic_toggle(self) -> None:
+        processes = self._running_mic_processes()
+        if not processes:
+            self.status_callback("麦克风悬浮窗未在运行")
+            return
+
+        closed = 0
+        elevated_pids: List[int] = []
+        errors: List[str] = []
+        for pid, name, path in processes:
+            try:
+                handle = win32api.OpenProcess(
+                    win32con.PROCESS_TERMINATE | win32con.PROCESS_QUERY_LIMITED_INFORMATION,
+                    False,
+                    pid,
+                )
+                try:
+                    win32api.TerminateProcess(handle, 0)
+                    closed += 1
+                finally:
+                    win32api.CloseHandle(handle)
+            except Exception as exc:
+                elevated_pids.append(pid)
+                errors.append(f"{name}({pid})：{exc}")
+
+        if elevated_pids:
+            pid_args = " ".join(f"/pid {pid}" for pid in elevated_pids)
+            try:
+                result = ctypes.windll.shell32.ShellExecuteW(
+                    None,
+                    "runas",
+                    "taskkill.exe",
+                    f"/f {pid_args}",
+                    None,
+                    0,
+                )
+                if result <= 32:
+                    raise OSError(f"ShellExecuteW failed: {result}")
+                self.status_callback(f"已请求管理员权限关闭麦克风悬浮窗（{len(elevated_pids)} 个进程）")
+                return
+            except Exception as exc:
+                messagebox.showerror(
+                    "关闭失败",
+                    "无法关闭麦克风悬浮窗。它可能正在以管理员权限运行，请用管理员身份运行工具箱后再点关闭。\n\n"
+                    + "\n".join(errors + [str(exc)]),
+                )
+                return
+
+        self.status_callback(f"已关闭麦克风悬浮窗（{closed} 个进程）")
+
+    def _mic_toggle_candidates(self, app_dir: Path) -> List[Path]:
+        return [
+            app_dir / "一键麦克风开关.exe",
+            app_dir / "mic_tool_workspace" / "dist" / "一键麦克风开关.exe",
+            app_dir / "mic_tool_workspace" / "dist" / "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
+            Path.home() / "Documents" / "工具箱" / "mic_tool_workspace" / "dist" / "一键麦克风开关.exe",
+            Path.home() / "Documents" / "工具箱" / "mic_tool_workspace" / "dist" / "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
+        ]
+
+    def _running_mic_processes(self) -> List[Tuple[int, str, str]]:
+        known_paths: Set[str] = set()
+        if getattr(sys, "frozen", False):
+            app_dir = Path(sys.executable).resolve().parent
+        else:
+            app_dir = Path(__file__).resolve().parent
+        for candidate in self._mic_toggle_candidates(app_dir):
+            try:
+                known_paths.add(str(candidate.resolve()).lower())
+            except Exception:
+                known_paths.add(str(candidate).lower())
+
+        matches: List[Tuple[int, str, str]] = []
+        current_pid = os.getpid()
+        try:
+            for pid in win32process.EnumProcesses():
+                if not pid or pid == current_pid:
+                    continue
+                handle = None
+                try:
+                    handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    path = win32process.GetModuleFileNameEx(handle, 0)
+                    name = Path(path).name
+                    normalized_path = str(Path(path).resolve()).lower()
+                    if name.lower() in {item.lower() for item in self.MIC_TOGGLE_NAMES} or normalized_path in known_paths:
+                        matches.append((pid, name, path))
+                except Exception:
+                    pass
+                finally:
+                    if handle:
+                        try:
+                            win32api.CloseHandle(handle)
+                        except Exception:
+                            pass
+        except Exception:
+            return []
+        return matches
 
     def _running_processes(self) -> List[str]:
         try:
