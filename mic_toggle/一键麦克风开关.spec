@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:\\1my_python\\一键麦克风开关.py'],
+    ['C:\\Users\\User\\Documents\\工具箱\\mic_tool_workspace\\一键麦克风开关.py'],
     pathex=[],
     binaries=[],
     datas=[],

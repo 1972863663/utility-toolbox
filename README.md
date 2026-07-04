@@ -27,3 +27,7 @@ The packaged executable is generated at `dist/UtilityToolbox.exe`.
 
 The helper is intentionally mouse-click-through so it does not block game clicks, cannot be dragged accidentally, and does not respond to mouse clicks by default.
 
+## Local consolidated layout
+
+On this machine the full working folder is consolidated at `C:\Users\User\Documents\工具箱`. The runnable toolbox is `工具箱.exe`. The microphone helper workspace is stored locally under `mic_tool_workspace/` and the toolbox looks for `mic_tool_workspace/dist/一键麦克风开关.exe` first after relocation.
+

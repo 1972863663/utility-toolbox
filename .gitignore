@@ -15,3 +15,8 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local consolidated binaries/workspaces
+/工具箱.exe
+/工具箱_桌面旧版.exe
+/mic_tool_workspace/

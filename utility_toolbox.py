@@ -1573,9 +1573,16 @@ class SystemToolsTab:
             if process.lower() == "一键麦克风开关.exe":
                 self.status_callback("麦克风悬浮窗已在运行")
                 return
+        if getattr(sys, "frozen", False):
+            app_dir = Path(sys.executable).resolve().parent
+        else:
+            app_dir = Path(__file__).resolve().parent
         candidates = [
-            Path.home() / "Desktop" / "一键麦克风开关.exe",
-            Path(r"C:\1my_python\dist\一键麦克风开关.exe"),
+            app_dir / "一键麦克风开关.exe",
+            app_dir / "mic_tool_workspace" / "dist" / "一键麦克风开关.exe",
+            app_dir / "mic_tool_workspace" / "dist" / "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
+            Path.home() / "Documents" / "工具箱" / "mic_tool_workspace" / "dist" / "一键麦克风开关.exe",
+            Path.home() / "Documents" / "工具箱" / "mic_tool_workspace" / "dist" / "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
         ]
         executable = next((path for path in candidates if path.exists()), None)
         if executable is None:
