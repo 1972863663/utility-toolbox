@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {"hotkey": "Ctrl+Alt+M", "hotkey_codes": [0x11, 0x12, 0x4D]}
 MUTEX_NAME = "Global\\MicToggleHotkeySingleInstance"
 
 GWL_EXSTYLE = -20
+GA_ROOT = 2
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 
@@ -206,9 +207,43 @@ def set_window_click_through(hwnd: int) -> None:
     get_style.restype = ctypes.c_void_p
     set_style.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
     set_style.restype = ctypes.c_void_p
-    style = int(get_style(wintypes.HWND(hwnd), GWL_EXSTYLE) or 0)
-    style |= WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
-    set_style(wintypes.HWND(hwnd), GWL_EXSTYLE, ctypes.c_void_p(style))
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+
+    # Tk can expose a child/wrapper HWND through winfo_id(). Apply the style to
+    # every plausible HWND in the parent chain plus the GA_ROOT top-level window.
+    targets: list[int] = []
+    current = int(hwnd)
+    while current and current not in targets:
+        targets.append(current)
+        current = int(user32.GetParent(wintypes.HWND(current)) or 0)
+    root = int(user32.GetAncestor(wintypes.HWND(hwnd), GA_ROOT) or 0)
+    if root and root not in targets:
+        targets.append(root)
+
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
+    flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+    for target in targets:
+        style = int(get_style(wintypes.HWND(target), GWL_EXSTYLE) or 0)
+        style |= WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+        set_style(wintypes.HWND(target), GWL_EXSTYLE, ctypes.c_void_p(style))
+        user32.SetWindowPos(wintypes.HWND(target), None, 0, 0, 0, 0, flags)
 
 
 def current_pressed_codes() -> list[int]:
@@ -338,7 +373,10 @@ class StatusOverlay:
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.82)
+        # Keep the overlay visually solid. Mouse pass-through is handled by
+        # WS_EX_TRANSPARENT, so alpha transparency is unnecessary and can make
+        # desktop/game content bleed through the label.
+        root.attributes("-alpha", 1.0)
         root.resizable(False, False)
 
         self.label = tk.Label(
@@ -352,6 +390,7 @@ class StatusOverlay:
         self.label.pack()
         self.place_top_right()
         self.enable_click_through()
+        self.reinforce_click_through()
 
     def place_top_right(self) -> None:
         self.root.update_idletasks()
@@ -365,6 +404,13 @@ class StatusOverlay:
     def enable_click_through(self) -> None:
         self.root.update_idletasks()
         set_window_click_through(int(self.root.winfo_id()))
+
+    def reinforce_click_through(self) -> None:
+        # Tk may rewrite extended window styles shortly after alpha/topmost
+        # changes. Reapply a few times so the final real HWND remains
+        # mouse-transparent.
+        for delay_ms in (50, 150, 350, 750, 1500):
+            self.root.after(delay_ms, self.enable_click_through)
 
     def set_state(self, muted: bool) -> None:
         if self.muted == muted:
