@@ -19,10 +19,16 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 DEFAULT_CONFIG = {"hotkey": "Ctrl+Alt+M", "hotkey_codes": [0x11, 0x12, 0x4D]}
 MUTEX_NAME = "Global\\MicToggleHotkeySingleInstance"
 
+GWLP_WNDPROC = -4
 GWL_EXSTYLE = -20
 GA_ROOT = 2
+WM_NCHITTEST = 0x0084
+HTTRANSPARENT = -1
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_LAYERED = 0x00080000
 WS_EX_TOOLWINDOW = 0x00000080
+LWA_ALPHA = 0x00000002
+_CLICK_THROUGH_WNDPROCS: dict[int, tuple[object, int]] = {}
 
 CLSCTX_ALL = 23
 E_CAPTURE = 1
@@ -187,11 +193,10 @@ def key_down(vk: int) -> bool:
 def set_window_click_through(hwnd: int) -> None:
     """Make a Windows Tk top-level window ignore mouse input.
 
-    WS_EX_TRANSPARENT makes hit-testing fall through to windows below it, so the
-    overlay does not block games or other full-screen applications. Do not set
-    WS_EX_LAYERED here: Tk already owns the layered-window state when
-    root.attributes("-alpha", ...) is used, and forcing the flag here can corrupt
-    Tk's painting on Windows.
+    WS_EX_TRANSPARENT only becomes a reliable real mouse click-through style for
+    this Tk overlay when paired with WS_EX_LAYERED. Keep the layered alpha at
+    255 so the overlay remains visually solid instead of bleeding the desktop or
+    game through the label.
     """
 
     if os.name != "nt" or not hwnd:
@@ -207,10 +212,23 @@ def set_window_click_through(hwnd: int) -> None:
     get_style.restype = ctypes.c_void_p
     set_style.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
     set_style.restype = ctypes.c_void_p
+    user32.CallWindowProcW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.CallWindowProcW.restype = ctypes.c_longlong
     user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     user32.GetAncestor.restype = wintypes.HWND
     user32.GetParent.argtypes = [wintypes.HWND]
     user32.GetParent.restype = wintypes.HWND
+    kernel32 = ctypes.windll.kernel32
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    kernel32.GetCurrentProcessId.argtypes = []
+    kernel32.GetCurrentProcessId.restype = wintypes.DWORD
     user32.SetWindowPos.argtypes = [
         wintypes.HWND,
         wintypes.HWND,
@@ -221,6 +239,13 @@ def set_window_click_through(hwnd: int) -> None:
         wintypes.UINT,
     ]
     user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetLayeredWindowAttributes.argtypes = [
+        wintypes.HWND,
+        wintypes.COLORREF,
+        ctypes.c_ubyte,
+        wintypes.DWORD,
+    ]
+    user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
 
     # Tk can expose a child/wrapper HWND through winfo_id(). Apply the style to
     # every plausible HWND in the parent chain plus the GA_ROOT top-level window.
@@ -233,16 +258,101 @@ def set_window_click_through(hwnd: int) -> None:
     if root and root not in targets:
         targets.append(root)
 
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    def window_rect(target: int) -> tuple[int, int, int, int]:
+        rect = RECT()
+        user32.GetWindowRect(wintypes.HWND(target), ctypes.byref(rect))
+        return rect.left, rect.top, rect.right, rect.bottom
+
+    base_left, base_top, base_right, base_bottom = window_rect(int(hwnd))
+    base_area = max(1, (base_right - base_left) * (base_bottom - base_top))
+
+    def is_overlay_sized(target: int) -> bool:
+        left, top, right, bottom = window_rect(target)
+        width = right - left
+        height = bottom - top
+        if width <= 0 or height <= 0:
+            return False
+        area = width * height
+        # Keep this scoped to the tiny overlay and its same-sized Tk child/wrapper
+        # HWNDs. Do not touch unrelated large Tk internals owned by the process.
+        same_position = abs(left - base_left) <= 8 and abs(top - base_top) <= 8
+        similar_size = area <= base_area * 4
+        return same_position and similar_size
+
+    # Tk may also create child HWNDs inside the visible top-level. If any child
+    # remains hit-testable, clicks still get eaten by this process even when the
+    # top-level has WS_EX_TRANSPARENT. Mark overlay-sized HWNDs owned by this
+    # process, then force WM_NCHITTEST to return HTTRANSPARENT for each.
+    current_pid = int(kernel32.GetCurrentProcessId())
+    enum_windows_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def collect_owned_window(candidate: int) -> None:
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(wintypes.HWND(candidate), ctypes.byref(owner_pid))
+        if owner_pid.value == current_pid and is_overlay_sized(candidate) and candidate not in targets:
+            targets.append(candidate)
+
+    def enum_child(hwnd_child, _lparam):
+        collect_owned_window(int(hwnd_child))
+        return True
+
+    def enum_top(hwnd_top, _lparam):
+        collect_owned_window(int(hwnd_top))
+        user32.EnumChildWindows(wintypes.HWND(hwnd_top), enum_windows_proc(enum_child), 0)
+        return True
+
+    user32.EnumWindows(enum_windows_proc(enum_top), 0)
+
     SWP_NOSIZE = 0x0001
     SWP_NOMOVE = 0x0002
     SWP_NOZORDER = 0x0004
     SWP_NOACTIVATE = 0x0010
     SWP_FRAMECHANGED = 0x0020
     flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+
+    wndproc_type = ctypes.WINFUNCTYPE(
+        ctypes.c_longlong,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+
+    def subclass_for_hit_test(target: int) -> None:
+        if target in _CLICK_THROUGH_WNDPROCS:
+            return
+        old_proc_holder: dict[str, int] = {"old": 0}
+
+        def wndproc(hwnd_arg, msg, wparam, lparam):
+            if msg == WM_NCHITTEST:
+                return HTTRANSPARENT
+            return user32.CallWindowProcW(
+                ctypes.c_void_p(old_proc_holder["old"]),
+                hwnd_arg,
+                msg,
+                wparam,
+                lparam,
+            )
+
+        callback = wndproc_type(wndproc)
+        old_proc = int(set_style(wintypes.HWND(target), GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p)) or 0)
+        old_proc_holder["old"] = old_proc
+        _CLICK_THROUGH_WNDPROCS[target] = (callback, old_proc)
+
     for target in targets:
         style = int(get_style(wintypes.HWND(target), GWL_EXSTYLE) or 0)
-        style |= WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+        style |= WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW
         set_style(wintypes.HWND(target), GWL_EXSTYLE, ctypes.c_void_p(style))
+        user32.SetLayeredWindowAttributes(wintypes.HWND(target), 0, 255, LWA_ALPHA)
+        subclass_for_hit_test(target)
         user32.SetWindowPos(wintypes.HWND(target), None, 0, 0, 0, 0, flags)
 
 
