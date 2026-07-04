@@ -4,6 +4,8 @@ A local Windows Tkinter utility toolbox packaged with PyInstaller.
 
 ## Key files
 
+- `docs/PROJECT_HANDOFF.md` - detailed handoff document for maintainers and future agents
+
 - `utility_toolbox.py` - main application
 - `subtitle_sync_embedded.py` - embedded subtitle sync tool
 - `media_organizer/` - media organizer module
@@ -29,5 +31,6 @@ The helper is intentionally mouse-click-through so it does not block game clicks
 
 ## Local consolidated layout
 
-On this machine the full working folder is consolidated at `C:\Users\User\Documents\工具箱`. The runnable toolbox is `工具箱.exe`. The microphone helper workspace is stored locally under `mic_tool_workspace/` and the toolbox looks for `mic_tool_workspace/dist/一键麦克风开关.exe` first after relocation.
+On this machine the full working folder is consolidated at `C:\Users\User\Desktop\Python\工具箱`. The runnable toolbox is `工具箱.exe`. The microphone helper workspace is stored locally under `mic_tool_workspace/` and the toolbox looks for `mic_tool_workspace/dist/一键麦克风开关.exe` first after relocation. For full handoff details, see `docs/PROJECT_HANDOFF.md`.
+
 
