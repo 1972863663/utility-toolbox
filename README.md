@@ -19,3 +19,11 @@ pyinstaller UtilityToolbox.spec --noconfirm
 ```
 
 The packaged executable is generated at `dist/UtilityToolbox.exe`.
+
+## Microphone overlay helper
+
+- `mic_toggle/一键麦克风开关.py` - click-through microphone status overlay and hotkey toggle helper
+- `mic_toggle/一键麦克风开关.spec` - PyInstaller build configuration for the helper
+
+The helper is intentionally mouse-click-through so it does not block game clicks, cannot be dragged accidentally, and does not respond to mouse clicks by default.
+
