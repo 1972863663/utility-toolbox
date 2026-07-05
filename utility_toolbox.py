@@ -59,6 +59,26 @@ APP_ICON_FILE = "utility_toolbox.ico"
 LAUNCHER_CLOSE_EXTENSIONS = {".exe", ".bat", ".cmd", ".py", ".ps1", ".lnk"}
 PROCESS_EXECUTABLE_EXTENSIONS = {".exe"}
 DIRECTORY_SCOPE_KEYWORDS = ("launcher", "runner", "start", "auto", "启动器", "启动")
+LAUNCHER_REPAIR_IGNORE_DIRS = {
+    "$recycle.bin",
+    "$windows.~bt",
+    "$windows.~ws",
+    ".git",
+    ".pytest_cache",
+    "__pycache__",
+    "appdata",
+    "application data",
+    "cache",
+    "cookies",
+    "node_modules",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "recovery",
+    "system volume information",
+    "windows",
+}
+LAUNCHER_REPAIR_MAX_SECONDS = 25
 
 THEME = {
     "bg": "#f5f7fb",
@@ -1801,6 +1821,7 @@ class LauncherTab:
         ttk.Button(actions, text="启动选中", command=self.launch_selected).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
         ttk.Button(actions, text="启动当前组", command=self.launch_current_group).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
         ttk.Button(actions, text="关闭当前组", command=self.close_current_group).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
+        ttk.Button(actions, text="修复失效路径", command=self.repair_current_group).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
 
         columns = ("name", "type", "path")
         self.app_tree = ttk.Treeview(main, columns=columns, show="headings", selectmode="extended")
@@ -1915,6 +1936,12 @@ class LauncherTab:
     def launch_apps(self, apps: List[Dict[str, str]]) -> None:
         threading.Thread(target=self._launch_worker, args=(apps,), daemon=True).start()
 
+    def repair_current_group(self) -> None:
+        if not self.current_group:
+            return
+        apps = self.groups.get(self.current_group, {}).get("apps", [])
+        threading.Thread(target=self._repair_worker, args=(apps,), daemon=True).start()
+
     def close_current_group(self) -> None:
         if self.current_group:
             paths: List[str] = []
@@ -1931,8 +1958,13 @@ class LauncherTab:
 
     def _launch_worker(self, apps: List[Dict[str, str]]) -> None:
         learned_any = False
+        repaired_any = False
         for app in apps:
             path = app.get("path", "")
+            repaired_path = self._ensure_launch_path(app)
+            if repaired_path and repaired_path != path:
+                path = repaired_path
+                repaired_any = True
             before = running_process_paths()
             try:
                 if Path(path).suffix.lower() == ".url":
@@ -1956,8 +1988,165 @@ class LauncherTab:
                 self.parent.after(0, lambda p=path: self.log(f"已启动：{Path(p).name}"))
             except Exception as exc:
                 self.parent.after(0, lambda p=path, e=exc: self.log(f"启动失败：{Path(p).name} - {e}"))
-        if learned_any:
+        if learned_any or repaired_any:
             self.parent.after(0, self.save_config)
+            self.parent.after(0, self.refresh_apps)
+
+    def _repair_worker(self, apps: List[Dict[str, str]]) -> None:
+        repaired = 0
+        missing = 0
+        for app in apps:
+            old_path = app.get("path", "")
+            if old_path and Path(old_path).exists():
+                continue
+            found = self._find_relocated_path(app)
+            if found:
+                app["path"] = found
+                app["type"] = self.file_type(found)
+                repaired += 1
+                self.parent.after(0, lambda n=app.get("name", Path(found).name), p=found: self.log(f"已修复路径：{n} -> {p}"))
+            else:
+                missing += 1
+                self.parent.after(0, lambda n=app.get("name", Path(old_path).name): self.log(f"未找到新位置：{n}"))
+        if repaired:
+            self.parent.after(0, self.save_config)
+            self.parent.after(0, self.refresh_apps)
+        self.parent.after(0, lambda: self.log(f"路径修复完成：修复 {repaired} 个，未找到 {missing} 个"))
+
+    def _ensure_launch_path(self, app: Dict[str, str]) -> str:
+        path = app.get("path", "")
+        if path and Path(path).exists():
+            return path
+        found = self._find_relocated_path(app)
+        if not found:
+            return path
+        old_path = path
+        app["path"] = found
+        app["type"] = self.file_type(found)
+        self.parent.after(0, lambda n=app.get("name", Path(found).name), old=old_path, new=found: self.log(f"启动前已自动修复路径：{n} -> {new}"))
+        return found
+
+    def _find_relocated_path(self, app: Dict[str, str]) -> Optional[str]:
+        old_path = app.get("path", "")
+        target_name = (app.get("name") or Path(old_path).name).lower()
+        if not target_name:
+            return None
+
+        direct_candidates: List[Path] = []
+        if old_path:
+            direct_candidates.append(Path(old_path))
+            if Path(old_path).suffix.lower() == ".lnk":
+                try:
+                    direct_candidates.append(Path(resolve_shortcut_target(old_path)))
+                except Exception:
+                    pass
+        close_paths = app.get("close_paths", [])
+        if isinstance(close_paths, list):
+            direct_candidates.extend(Path(str(path)) for path in close_paths if path)
+
+        for candidate in direct_candidates:
+            try:
+                if candidate.exists() and candidate.name.lower() == target_name:
+                    return str(candidate)
+            except Exception:
+                pass
+
+        search_roots = self._launcher_search_roots(old_path)
+        deadline = time.monotonic() + LAUNCHER_REPAIR_MAX_SECONDS
+        matches: List[Path] = []
+        for root in search_roots:
+            if time.monotonic() > deadline:
+                break
+            matches.extend(self._find_by_name(root, target_name, deadline, limit=8))
+            if matches:
+                break
+
+        if not matches:
+            return None
+        return str(self._choose_best_repair_match(matches, old_path))
+
+    def _launcher_search_roots(self, old_path: str) -> List[Path]:
+        roots: List[Path] = []
+
+        def add(path: Path) -> None:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if not resolved.exists() or not resolved.is_dir():
+                return
+            normalized = str(resolved).lower()
+            if normalized not in seen:
+                seen.add(normalized)
+                roots.append(resolved)
+
+        seen: Set[str] = set()
+        if old_path:
+            old = Path(old_path)
+            for parent in list(old.parents)[:3]:
+                add(parent)
+        for path in [
+            Path.home() / "Desktop",
+            Path.home() / "Documents",
+            Path.home() / "Downloads",
+            Path.home() / "Desktop" / "Python",
+            Path(__file__).resolve().parent,
+        ]:
+            add(path)
+        if os.name == "nt":
+            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            for index in range(26):
+                if bitmask & (1 << index):
+                    add(Path(f"{chr(65 + index)}:\\"))
+        return roots
+
+    def _find_by_name(self, root: Path, target_name: str, deadline: float, limit: int = 8) -> List[Path]:
+        matches: List[Path] = []
+        try:
+            walker = os.walk(root)
+            for current, dirs, files in walker:
+                if time.monotonic() > deadline or len(matches) >= limit:
+                    break
+                dirs[:] = [
+                    name for name in dirs
+                    if name.lower() not in LAUNCHER_REPAIR_IGNORE_DIRS
+                    and not name.startswith(".")
+                ]
+                for filename in files:
+                    if filename.lower() == target_name:
+                        candidate = Path(current) / filename
+                        try:
+                            if candidate.exists():
+                                matches.append(candidate)
+                                if len(matches) >= limit:
+                                    break
+                        except Exception:
+                            pass
+        except Exception:
+            return matches
+        return matches
+
+    def _choose_best_repair_match(self, matches: List[Path], old_path: str) -> Path:
+        old = Path(old_path) if old_path else None
+
+        def score(path: Path) -> Tuple[int, int, float, str]:
+            same_drive = 0
+            common_parts = 0
+            if old:
+                try:
+                    same_drive = 0 if path.drive.lower() == old.drive.lower() else 1
+                    left = [part.lower() for part in path.parts]
+                    right = [part.lower() for part in old.parts]
+                    common_parts = -sum(1 for a, b in zip(left, right) if a == b)
+                except Exception:
+                    pass
+            try:
+                mtime = -path.stat().st_mtime
+            except Exception:
+                mtime = 0
+            return (same_drive, common_parts, mtime, str(path).lower())
+
+        return sorted(matches, key=score)[0]
 
     def _close_worker(self, paths: List[str]) -> None:
         targets = [path for path in paths if Path(path).suffix.lower() in LAUNCHER_CLOSE_EXTENSIONS]
