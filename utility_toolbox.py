@@ -348,6 +348,40 @@ def terminate_process(pid: int) -> None:
         raise RuntimeError(detail or f"taskkill failed with exit code {completed.returncode}")
 
 
+def terminate_processes_fast(pids: Iterable[int]) -> Tuple[Set[int], Dict[int, str]]:
+    unique_pids: List[int] = []
+    seen: Set[int] = set()
+    for pid in pids:
+        if pid and pid not in seen:
+            seen.add(pid)
+            unique_pids.append(pid)
+    if not unique_pids:
+        return set(), {}
+
+    args = ["taskkill", "/T", "/F"]
+    for pid in unique_pids:
+        args.extend(["/PID", str(pid)])
+    completed = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    output = "\n".join(part for part in [completed.stdout, completed.stderr] if part).strip()
+    if completed.returncode == 0 or is_taskkill_already_closed(output):
+        return set(unique_pids), {}
+
+    closed: Set[int] = set()
+    failures: Dict[int, str] = {}
+    for pid in unique_pids:
+        try:
+            terminate_process(pid)
+            closed.add(pid)
+        except Exception as exc:
+            failures[pid] = str(exc)
+    return closed, failures
+
+
 def current_scale(root: tk.Tk) -> float:
     try:
         return max(0.9, min(1.8, root.winfo_fpixels("1i") / 96.0))
@@ -1959,13 +1993,14 @@ class LauncherTab:
     def _launch_worker(self, apps: List[Dict[str, str]]) -> None:
         learned_any = False
         repaired_any = False
+        before = running_process_paths()
+        launched_apps: List[Dict[str, str]] = []
         for app in apps:
             path = app.get("path", "")
-            repaired_path = self._ensure_launch_path(app)
+            repaired_path = self._ensure_launch_path(app, max_seconds=5)
             if repaired_path and repaired_path != path:
                 path = repaired_path
                 repaired_any = True
-            before = running_process_paths()
             try:
                 if Path(path).suffix.lower() == ".url":
                     for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -1974,20 +2009,30 @@ class LauncherTab:
                             break
                 else:
                     os.startfile(path)
-                time.sleep(2)
-                learned = discover_new_process_paths(before, running_process_paths())
-                if learned:
-                    existing = app.setdefault("close_paths", [])
-                    if isinstance(existing, list):
-                        seen = {normalize_process_path(item) for item in existing}
-                        for process_path in learned:
-                            if normalize_process_path(process_path) not in seen:
-                                existing.append(process_path)
-                                seen.add(normalize_process_path(process_path))
-                                learned_any = True
+                launched_apps.append(app)
                 self.parent.after(0, lambda p=path: self.log(f"已启动：{Path(p).name}"))
             except Exception as exc:
                 self.parent.after(0, lambda p=path, e=exc: self.log(f"启动失败：{Path(p).name} - {e}"))
+
+        if len(launched_apps) == 1:
+            # 以前每个应用启动后都固定等待 2 秒；4 个应用就是至少 8 秒。
+            # 现在启动请求先立即发出，再只在后台学习 close_paths。
+            # 用户感知的启动速度接近 os.startfile 本身，学习进程路径不阻塞后续启动。
+            learned_paths: List[str] = []
+            for delay in (0.6, 1.6):
+                time.sleep(delay)
+                learned_paths.extend(discover_new_process_paths(before, running_process_paths()))
+            if learned_paths:
+                app = launched_apps[0]
+                existing = app.setdefault("close_paths", [])
+                if isinstance(existing, list):
+                    seen = {normalize_process_path(item) for item in existing}
+                    for process_path in learned_paths:
+                        normalized = normalize_process_path(process_path)
+                        if normalized not in seen:
+                            existing.append(process_path)
+                            seen.add(normalized)
+                            learned_any = True
         if learned_any or repaired_any:
             self.parent.after(0, self.save_config)
             self.parent.after(0, self.refresh_apps)
@@ -1999,7 +2044,7 @@ class LauncherTab:
             old_path = app.get("path", "")
             if old_path and Path(old_path).exists():
                 continue
-            found = self._find_relocated_path(app)
+            found = self._find_relocated_path(app, max_seconds=LAUNCHER_REPAIR_MAX_SECONDS)
             if found:
                 app["path"] = found
                 app["type"] = self.file_type(found)
@@ -2013,11 +2058,11 @@ class LauncherTab:
             self.parent.after(0, self.refresh_apps)
         self.parent.after(0, lambda: self.log(f"路径修复完成：修复 {repaired} 个，未找到 {missing} 个"))
 
-    def _ensure_launch_path(self, app: Dict[str, str]) -> str:
+    def _ensure_launch_path(self, app: Dict[str, str], max_seconds: int = 5) -> str:
         path = app.get("path", "")
         if path and Path(path).exists():
             return path
-        found = self._find_relocated_path(app)
+        found = self._find_relocated_path(app, max_seconds=max_seconds)
         if not found:
             return path
         old_path = path
@@ -2026,7 +2071,7 @@ class LauncherTab:
         self.parent.after(0, lambda n=app.get("name", Path(found).name), old=old_path, new=found: self.log(f"启动前已自动修复路径：{n} -> {new}"))
         return found
 
-    def _find_relocated_path(self, app: Dict[str, str]) -> Optional[str]:
+    def _find_relocated_path(self, app: Dict[str, str], max_seconds: int = LAUNCHER_REPAIR_MAX_SECONDS) -> Optional[str]:
         old_path = app.get("path", "")
         target_name = (app.get("name") or Path(old_path).name).lower()
         if not target_name:
@@ -2052,7 +2097,7 @@ class LauncherTab:
                 pass
 
         search_roots = self._launcher_search_roots(old_path)
-        deadline = time.monotonic() + LAUNCHER_REPAIR_MAX_SECONDS
+        deadline = time.monotonic() + max_seconds
         matches: List[Path] = []
         for root in search_roots:
             if time.monotonic() > deadline:
@@ -2157,12 +2202,14 @@ class LauncherTab:
         if not matches:
             self.parent.after(0, lambda: self.log("当前组没有找到正在运行的应用"))
             return
-        for pid, process_path in matches:
-            try:
-                terminate_process(pid)
-                self.parent.after(0, lambda p=process_path: self.log(f"已关闭：{Path(p).name}"))
-            except Exception as exc:
-                self.parent.after(0, lambda p=process_path, e=exc: self.log(f"关闭失败：{Path(p).name} - {e}"))
+        pid_to_path = {pid: process_path for pid, process_path in matches}
+        closed, failures = terminate_processes_fast(pid_to_path)
+        for pid in sorted(closed):
+            process_path = pid_to_path.get(pid, str(pid))
+            self.parent.after(0, lambda p=process_path: self.log(f"已关闭：{Path(p).name}"))
+        for pid, error in failures.items():
+            process_path = pid_to_path.get(pid, str(pid))
+            self.parent.after(0, lambda p=process_path, e=error: self.log(f"关闭失败：{Path(p).name} - {e}"))
 
     def log(self, message: str) -> None:
         self.log_text.insert(tk.END, f"[{datetime.now():%H:%M:%S}] {message}\n")
