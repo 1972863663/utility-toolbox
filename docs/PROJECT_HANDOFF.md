@@ -308,6 +308,7 @@ mic_toggle\一键麦克风开关.py
 - 扫描 `一键麦克风开关.exe` 和历史乱码名 `Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe`。
 - 找到后优先通过 Windows API `TerminateProcess` 结束。
 - 如果权限不足，则用 `ShellExecuteW(..., "runas", "taskkill.exe", ...)` 弹出 UAC 进行管理员关闭。
+- 主工具箱关闭/隐藏到托盘/真正退出时都会调用统一的 `close_mic_toggle_processes()`，确保麦克风悬浮窗不会在工具箱关闭后残留。
 
 注意点：
 

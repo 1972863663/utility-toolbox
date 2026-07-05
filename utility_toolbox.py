@@ -382,6 +382,49 @@ def terminate_processes_fast(pids: Iterable[int]) -> Tuple[Set[int], Dict[int, s
     return closed, failures
 
 
+MIC_TOGGLE_PROCESS_NAMES = {
+    "一键麦克风开关.exe",
+    "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
+}
+
+
+def running_mic_toggle_processes() -> List[Tuple[int, str, str]]:
+    matches: List[Tuple[int, str, str]] = []
+    current_pid = os.getpid()
+    names = {name.lower() for name in MIC_TOGGLE_PROCESS_NAMES}
+    try:
+        for pid in win32process.EnumProcesses():
+            if not pid or pid == current_pid:
+                continue
+            handle = None
+            try:
+                handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                path = win32process.GetModuleFileNameEx(handle, 0)
+                name = Path(path).name
+                if name.lower() in names:
+                    matches.append((pid, name, path))
+            except Exception:
+                pass
+            finally:
+                if handle:
+                    try:
+                        win32api.CloseHandle(handle)
+                    except Exception:
+                        pass
+    except Exception:
+        return []
+    return matches
+
+
+def close_mic_toggle_processes() -> Tuple[int, Dict[int, str]]:
+    processes = running_mic_toggle_processes()
+    if not processes:
+        return 0, {}
+    pids = [pid for pid, _name, _path in processes]
+    closed, failures = terminate_processes_fast(pids)
+    return len(closed), failures
+
+
 def current_scale(root: tk.Tk) -> float:
     try:
         return max(0.9, min(1.8, root.winfo_fpixels("1i") / 96.0))
@@ -1170,6 +1213,7 @@ class TrayIcon:
             win32gui.PostMessage(self.hwnd, win32con.WM_DESTROY, 0, 0)
 
     def exit_app(self) -> None:
+        close_mic_toggle_processes()
         if self.exit_callback:
             self.exit_callback()
         else:
@@ -1651,32 +1695,12 @@ class SystemToolsTab:
             messagebox.showerror("启动失败", f"无法启动麦克风悬浮窗：{exc}")
 
     def close_mic_toggle(self) -> None:
-        processes = self._running_mic_processes()
-        if not processes:
+        closed, failures = close_mic_toggle_processes()
+        if closed <= 0 and not failures:
             self.status_callback("麦克风悬浮窗未在运行")
             return
-
-        closed = 0
-        elevated_pids: List[int] = []
-        errors: List[str] = []
-        for pid, name, path in processes:
-            try:
-                handle = win32api.OpenProcess(
-                    win32con.PROCESS_TERMINATE | win32con.PROCESS_QUERY_LIMITED_INFORMATION,
-                    False,
-                    pid,
-                )
-                try:
-                    win32api.TerminateProcess(handle, 0)
-                    closed += 1
-                finally:
-                    win32api.CloseHandle(handle)
-            except Exception as exc:
-                elevated_pids.append(pid)
-                errors.append(f"{name}({pid})：{exc}")
-
-        if elevated_pids:
-            pid_args = " ".join(f"/pid {pid}" for pid in elevated_pids)
+        if failures:
+            pid_args = " ".join(f"/pid {pid}" for pid in failures)
             try:
                 result = ctypes.windll.shell32.ShellExecuteW(
                     None,
@@ -1688,13 +1712,13 @@ class SystemToolsTab:
                 )
                 if result <= 32:
                     raise OSError(f"ShellExecuteW failed: {result}")
-                self.status_callback(f"已请求管理员权限关闭麦克风悬浮窗（{len(elevated_pids)} 个进程）")
+                self.status_callback(f"已请求管理员权限关闭麦克风悬浮窗（{len(failures)} 个进程）")
                 return
             except Exception as exc:
                 messagebox.showerror(
                     "关闭失败",
                     "无法关闭麦克风悬浮窗。它可能正在以管理员权限运行，请用管理员身份运行工具箱后再点关闭。\n\n"
-                    + "\n".join(errors + [str(exc)]),
+                    + "\n".join([f"{pid}：{error}" for pid, error in failures.items()] + [str(exc)]),
                 )
                 return
 
@@ -2331,6 +2355,7 @@ class UtilityToolbox:
         self.config = load_config()
         self.scale = current_scale(root)
         self.root.title(APP_NAME)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         icon_path = app_icon_path()
         if icon_path.exists():
             try:
@@ -2528,11 +2553,13 @@ class UtilityToolbox:
         save_config(self.config)
 
     def hide_to_tray(self) -> None:
+        close_mic_toggle_processes()
         self.root.withdraw()
         self.set_status("已隐藏到托盘，双击托盘图标可重新打开")
 
     def quit_app(self) -> None:
         try:
+            close_mic_toggle_processes()
             if self.window_refresh_job:
                 self.root.after_cancel(self.window_refresh_job)
             self.backup.stop()
@@ -2557,7 +2584,10 @@ def main() -> int:
     if start_minimized:
         root.withdraw()
     UtilityToolbox(root, start_minimized=start_minimized)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        close_mic_toggle_processes()
     return 0
 
 
