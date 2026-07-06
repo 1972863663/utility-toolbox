@@ -2419,20 +2419,33 @@ class MacroToolsTab:
                 return path
         return candidates[0]
 
-    def _python_executable(self, prefer_windowed: bool = False) -> str:
+    def _python_executable(self, prefer_windowed: bool = False) -> Optional[str]:
+        names = ["pythonw.exe", "python.exe"] if prefer_windowed else ["python.exe", "pythonw.exe"]
         current = Path(sys.executable)
-        if current.name.lower() not in {"python.exe", "pythonw.exe"}:
-            for name in (["pythonw.exe", "python.exe"] if prefer_windowed else ["python.exe", "pythonw.exe"]):
-                candidate = current.with_name(name)
-                if candidate.exists():
-                    return str(candidate)
-        return str(current)
+        if current.name.lower() in {"python.exe", "pythonw.exe"}:
+            return str(current)
+        for name in names:
+            candidate = current.with_name(name)
+            if candidate.exists():
+                return str(candidate)
+        for name in names:
+            found = shutil.which(name) or shutil.which(name.replace(".exe", ""))
+            if found:
+                return found
+        py_launcher = shutil.which("py.exe") or shutil.which("py")
+        if py_launcher:
+            return py_launcher
+        return None
 
     def _launch_python_script(self, script: Path, args: Optional[List[str]] = None, new_console: bool = False, windowed: bool = False) -> None:
         if not script.exists():
             messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u627e\u4e0d\u5230\u811a\u672c\uff1a\n{script}")
             return
-        cmd = [self._python_executable(prefer_windowed=windowed), str(script)] + list(args or [])
+        python_exe = self._python_executable(prefer_windowed=windowed)
+        if not python_exe:
+            messagebox.showerror("\u542f\u52a8\u5931\u8d25", "\u627e\u4e0d\u5230 Python\uff0c\u4e5f\u6ca1\u6709\u53ef\u7528\u7684\u5185\u7f6e exe\u3002")
+            return
+        cmd = [python_exe, str(script)] + list(args or [])
         flags = 0
         if os.name == "nt" and new_console:
             flags |= subprocess.CREATE_NEW_CONSOLE
@@ -2485,7 +2498,11 @@ class MacroToolsTab:
         if not req.exists():
             messagebox.showerror("\u4f9d\u8d56\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u627e\u4e0d\u5230\uff1a\n{req}")
             return
-        cmd = [self._python_executable(), "-m", "pip", "install", "-r", str(req)]
+        python_exe = self._python_executable()
+        if not python_exe:
+            messagebox.showerror("\u627e\u4e0d\u5230 Python", "\u672a\u627e\u5230 python.exe\u3002\u5185\u7f6e exe \u53ef\u76f4\u63a5\u4f7f\u7528\uff1b\u5982\u9700\u5b89\u88c5\u4f9d\u8d56\uff0c\u8bf7\u5148\u5b89\u88c5 Python \u5e76\u52a0\u5165 PATH\u3002")
+            return
+        cmd = [python_exe, "-m", "pip", "install", "-r", str(req)]
         flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
         subprocess.Popen(cmd, cwd=str(folder), creationflags=flags)
         self.status_callback("\u5df2\u6253\u5f00\u4f9d\u8d56\u5b89\u88c5\u7a97\u53e3")
@@ -2510,15 +2527,17 @@ class MacroToolsTab:
     def create_desktop_loop_bat(self) -> None:
         folder = self.macro_tools_dir()
         script = folder / "interception_loop_macro.py"
+        exe = folder / "interception_loop_macro.exe"
         macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
         desktop = Path.home() / "Desktop"
         bat = desktop / "run_interception_macro.bat"
+        command = f'"{exe}" "{macro_json}"' if exe.exists() else f'python "{script}" "{macro_json}"'
         content = (
             "@echo off\n"
             "chcp 65001 >nul\n"
             f"cd /d \"{folder}\"\n"
             "echo Starting Interception loop macro...\n"
-            f"python \"{script}\" \"{macro_json}\"\n"
+            f"{command}\n"
             "pause\n"
         )
         bat.write_text(content, encoding="ascii", errors="ignore")
