@@ -2349,6 +2349,182 @@ class MediaOrganizerTab:
         self.status_callback("照片视频整理完成")
 
 
+
+class MacroToolsTab:
+    def __init__(self, parent: ttk.Frame, status_callback: Callable[[str], None]):
+        self.parent = parent
+        self.status_callback = status_callback
+        self.macro_json_var = tk.StringVar(value=str(Path.home() / "Desktop" / "macro_recording.json"))
+        self._build()
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self.parent, padding=18)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        title = ttk.Label(outer, text="\u9f20\u6807\u952e\u76d8\u5b8f\u5de5\u5177", font=("Microsoft YaHei UI", 20, "bold"))
+        title.pack(anchor=tk.W, pady=(0, 8))
+        desc = ttk.Label(
+            outer,
+            text="\u5f55\u5236\u9f20\u6807\u548c\u952e\u76d8\u64cd\u4f5c\uff0c\u5bfc\u51fa JSON\uff1b\u4f7f\u7528 Interception \u5faa\u73af\u56de\u653e\u3002\u9ed8\u8ba4 mouse:x1 \u5f00\u59cb/\u6682\u505c\uff0c\u5faa\u73af\u95f4\u9694 0.1 \u79d2\u3002",
+            wraplength=980,
+        )
+        desc.pack(anchor=tk.W, fill=tk.X, pady=(0, 16))
+
+        path_box = ttk.LabelFrame(outer, text="\u5b8f\u6587\u4ef6", padding=12)
+        path_box.pack(fill=tk.X, pady=(0, 14))
+        path_box.columnconfigure(0, weight=1)
+        ttk.Entry(path_box, textvariable=self.macro_json_var).grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
+        ttk.Button(path_box, text="\u9009\u62e9 JSON", command=self.choose_macro_json).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(path_box, text="\u6253\u5f00\u6240\u5728\u76ee\u5f55", command=self.open_macro_json_folder).grid(row=0, column=2)
+
+        actions = ttk.LabelFrame(outer, text="\u64cd\u4f5c", padding=12)
+        actions.pack(fill=tk.X, pady=(0, 14))
+        for i in range(3):
+            actions.columnconfigure(i, weight=1, uniform="macro_actions")
+        ttk.Button(actions, text="\u542f\u52a8\u5b8f\u5f55\u5236\u5668", command=self.launch_recorder).grid(row=0, column=0, sticky=tk.EW, padx=4, pady=4)
+        ttk.Button(actions, text="\u542f\u52a8\u5faa\u73af\u56de\u653e", command=self.launch_loop_player).grid(row=0, column=1, sticky=tk.EW, padx=4, pady=4)
+        ttk.Button(actions, text="\u5b89\u88c5/\u68c0\u67e5\u4f9d\u8d56", command=self.install_requirements).grid(row=0, column=2, sticky=tk.EW, padx=4, pady=4)
+        ttk.Button(actions, text="\u6253\u5f00\u5b8f\u5de5\u5177\u76ee\u5f55", command=self.open_macro_tools_folder).grid(row=1, column=0, sticky=tk.EW, padx=4, pady=4)
+        ttk.Button(actions, text="\u6253\u5f00\u684c\u9762\u5b8f\u6587\u4ef6", command=self.open_default_macro_json).grid(row=1, column=1, sticky=tk.EW, padx=4, pady=4)
+        ttk.Button(actions, text="\u590d\u5236\u4e00\u952e\u542f\u52a8 BAT \u5230\u684c\u9762", command=self.create_desktop_loop_bat).grid(row=1, column=2, sticky=tk.EW, padx=4, pady=4)
+
+        info = ttk.LabelFrame(outer, text="\u5f53\u524d\u89c4\u5219", padding=12)
+        info.pack(fill=tk.BOTH, expand=True)
+        text = (
+            "1. \u5f55\u5236\u5668\u9ed8\u8ba4 Ctrl+Shift+R \u5f00\u59cb/\u505c\u6b62\uff0c\u4e5f\u652f\u6301\u6355\u83b7 mouse:x1 / mouse:x2\u3002\n"
+            "2. \u5faa\u73af\u56de\u653e\u5668\u9ed8\u8ba4\u8bfb\u53d6\u4e0a\u65b9 JSON\uff0cmouse:x1 \u5f00\u542f/\u6682\u505c\u3002\n"
+            "3. \u5faa\u73af\u811a\u672c\u5df2\u53bb\u6389\u5f55\u5236\u5f00\u59cb\u540e\u7684\u524d\u6447\u7b49\u5f85\uff1a\u7b2c\u4e00\u6761\u6709\u6548\u52a8\u4f5c\u4f1a\u7acb\u5373\u6267\u884c\u3002\n"
+            "4. \u5982\u679c Interception \u56de\u653e\u65e0\u52a8\u4f5c\uff0c\u901a\u5e38\u662f\u9a71\u52a8\u3001\u6743\u9650\u6216\u8bbe\u5907\u8bc6\u522b\u95ee\u9898\uff1b\u70ed\u952e\u76d1\u542c\u5df2\u4f7f\u7528 pynput\uff0c\u56de\u653e\u4ecd\u4f7f\u7528 Interception\u3002"
+        )
+        label = ttk.Label(info, text=text, justify=tk.LEFT, wraplength=980)
+        label.pack(anchor=tk.W, fill=tk.X)
+
+    def macro_tools_dir(self) -> Path:
+        candidates = []
+        try:
+            candidates.append(Path(sys.executable).resolve().parent / "macro_tools")
+        except Exception:
+            pass
+        try:
+            candidates.append(resource_path("macro_tools"))
+        except Exception:
+            pass
+        try:
+            candidates.append(Path(__file__).resolve().parent / "macro_tools")
+        except Exception:
+            pass
+        candidates.append(Path.home() / "Documents" / "macro_loop")
+        for path in candidates:
+            if path.exists():
+                return path
+        return candidates[0]
+
+    def _python_executable(self, prefer_windowed: bool = False) -> str:
+        current = Path(sys.executable)
+        if current.name.lower() not in {"python.exe", "pythonw.exe"}:
+            for name in (["pythonw.exe", "python.exe"] if prefer_windowed else ["python.exe", "pythonw.exe"]):
+                candidate = current.with_name(name)
+                if candidate.exists():
+                    return str(candidate)
+        return str(current)
+
+    def _launch_python_script(self, script: Path, args: Optional[List[str]] = None, new_console: bool = False, windowed: bool = False) -> None:
+        if not script.exists():
+            messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u627e\u4e0d\u5230\u811a\u672c\uff1a\n{script}")
+            return
+        cmd = [self._python_executable(prefer_windowed=windowed), str(script)] + list(args or [])
+        flags = 0
+        if os.name == "nt" and new_console:
+            flags |= subprocess.CREATE_NEW_CONSOLE
+        subprocess.Popen(cmd, cwd=str(script.parent), creationflags=flags)
+
+    def _launch_exe_or_script(self, exe_name: str, script_name: str, args: Optional[List[str]] = None, new_console: bool = False, windowed: bool = False) -> None:
+        folder = self.macro_tools_dir()
+        exe = folder / exe_name
+        if exe.exists():
+            flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" and new_console else 0
+            subprocess.Popen([str(exe)] + list(args or []), cwd=str(folder), creationflags=flags)
+            return
+        self._launch_python_script(folder / script_name, args=args, new_console=new_console, windowed=windowed)
+
+    def choose_macro_json(self) -> None:
+        path = filedialog.askopenfilename(
+            title="\u9009\u62e9\u5b8f JSON",
+            filetypes=[("JSON \u6587\u4ef6", "*.json"), ("\u6240\u6709\u6587\u4ef6", "*.*")],
+            initialdir=str(Path.home() / "Desktop"),
+        )
+        if path:
+            self.macro_json_var.set(path)
+
+    def launch_recorder(self) -> None:
+        try:
+            self._launch_exe_or_script("macro_recorder.exe", "macro_recorder.py", windowed=True)
+            self.status_callback("\u5df2\u542f\u52a8\u5b8f\u5f55\u5236\u5668")
+        except Exception as exc:
+            messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u65e0\u6cd5\u542f\u52a8\u5b8f\u5f55\u5236\u5668\uff1a{exc}")
+
+    def launch_loop_player(self) -> None:
+        macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
+        if not Path(macro_json).exists():
+            messagebox.showerror("\u5b8f\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u627e\u4e0d\u5230\u5b8f JSON\uff1a\n{macro_json}")
+            return
+        try:
+            self._launch_exe_or_script(
+                "interception_loop_macro.exe",
+                "interception_loop_macro.py",
+                args=[macro_json],
+                new_console=True,
+            )
+            self.status_callback("\u5df2\u542f\u52a8 Interception \u5faa\u73af\u56de\u653e")
+        except Exception as exc:
+            messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u65e0\u6cd5\u542f\u52a8\u5faa\u73af\u56de\u653e\uff1a{exc}")
+
+    def install_requirements(self) -> None:
+        folder = self.macro_tools_dir()
+        req = folder / "requirements.txt"
+        if not req.exists():
+            messagebox.showerror("\u4f9d\u8d56\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u627e\u4e0d\u5230\uff1a\n{req}")
+            return
+        cmd = [self._python_executable(), "-m", "pip", "install", "-r", str(req)]
+        flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+        subprocess.Popen(cmd, cwd=str(folder), creationflags=flags)
+        self.status_callback("\u5df2\u6253\u5f00\u4f9d\u8d56\u5b89\u88c5\u7a97\u53e3")
+
+    def open_macro_tools_folder(self) -> None:
+        folder = self.macro_tools_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))
+
+    def open_macro_json_folder(self) -> None:
+        path = Path(self.macro_json_var.get().strip())
+        folder = path.parent if path.parent.exists() else Path.home() / "Desktop"
+        os.startfile(str(folder))
+
+    def open_default_macro_json(self) -> None:
+        path = Path.home() / "Desktop" / "macro_recording.json"
+        if path.exists():
+            os.startfile(str(path))
+        else:
+            messagebox.showinfo("\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u684c\u9762\u6ca1\u6709\u5b8f\u6587\u4ef6\uff1a\n{path}")
+
+    def create_desktop_loop_bat(self) -> None:
+        folder = self.macro_tools_dir()
+        script = folder / "interception_loop_macro.py"
+        macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
+        desktop = Path.home() / "Desktop"
+        bat = desktop / "run_interception_macro.bat"
+        content = (
+            "@echo off\n"
+            "chcp 65001 >nul\n"
+            f"cd /d \"{folder}\"\n"
+            "echo Starting Interception loop macro...\n"
+            f"python \"{script}\" \"{macro_json}\"\n"
+            "pause\n"
+        )
+        bat.write_text(content, encoding="ascii", errors="ignore")
+        self.status_callback(f"\u5df2\u5199\u5165 {bat}")
+        messagebox.showinfo("\u5df2\u521b\u5efa", f"\u5df2\u521b\u5efa\u684c\u9762\u542f\u52a8\u5668\uff1a\n{bat}")
+
 class UtilityToolbox:
     def __init__(self, root: tk.Tk, start_minimized: bool = False):
         self.root = root
@@ -2385,6 +2561,7 @@ class UtilityToolbox:
         startup_frame = ttk.Frame(notebook)
         launcher_frame = ttk.Frame(notebook)
         media_frame = ttk.Frame(notebook)
+        macro_frame = ttk.Frame(notebook)
 
         notebook.add(renamer_frame, text="批量重命名")
         notebook.add(topmost_frame, text="窗口置顶")
@@ -2396,6 +2573,7 @@ class UtilityToolbox:
         notebook.add(startup_frame, text="自启动")
         notebook.add(launcher_frame, text="应用启动器")
         notebook.add(media_frame, text="照片视频管家")
+        notebook.add(macro_frame, text="\u5b8f\u5de5\u5177")
 
         self.renamer = DateRenamerTab(renamer_frame)
         self.topmost = TopmostController(root, self.set_status)
@@ -2410,6 +2588,7 @@ class UtilityToolbox:
         self.startup = StartupTab(startup_frame, self.config, self.save_config, self.set_status)
         self.launcher = LauncherTab(launcher_frame, self.set_status)
         self.media = MediaOrganizerTab(media_frame, self.set_status)
+        self.macro_tools = MacroToolsTab(macro_frame, self.set_status)
 
         status = ttk.Label(root, textvariable=self.status_var, anchor=tk.W, padding=(8, 4))
         status.pack(fill=tk.X)
