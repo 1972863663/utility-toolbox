@@ -14,8 +14,9 @@ Interception 循环宏回放器
 
 from __future__ import annotations
 
-import copy
+import argparse
 import json
+import os
 import sys
 import time
 import threading
@@ -27,6 +28,10 @@ try:
     from pynput import mouse as pynput_mouse
 except Exception:
     pynput_mouse = None
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception:
+    pynput_keyboard = None
 
 
 MACRO_JSON = Path(r"C:\Users\User\Desktop\macro_recording.json")
@@ -65,14 +70,29 @@ KEY_MAP = {
 SUPPORTED_EVENT_TYPES = {"mouse_click", "mouse_move", "mouse_scroll", "key_press", "key_release"}
 
 
+def configure_console_encoding() -> None:
+    if os.name == "nt":
+        try:
+            os.system("chcp 65001 >nul")
+        except Exception:
+            pass
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 class RuntimeState:
-    def __init__(self) -> None:
+    def __init__(self, hotkey_display: str = TOGGLE_HOTKEY) -> None:
         self.enabled = threading.Event()
         self.quit = threading.Event()
         self.lock = threading.RLock()
         self.loop_count = 0
         self.pressed_keys: Set[str] = set()
         self.pressed_mouse_buttons: Set[str] = set()
+        self.hotkey_display = hotkey_display
 
     def toggle(self) -> None:
         with self.lock:
@@ -103,6 +123,28 @@ def normalize_mouse_hotkey(hotkey: str) -> str:
     return aliases[text]
 
 
+
+
+def parse_hotkey_config(hotkey: str) -> tuple[str, str, str]:
+    raw = str(hotkey or TOGGLE_HOTKEY).strip() or TOGGLE_HOTKEY
+    compact = raw.lower().replace(" ", "")
+    if compact.startswith("mouse:") or compact in {"x1", "x2", "mouse4", "mouse5", "back", "forward", "??1", "??2"}:
+        button = normalize_mouse_hotkey(raw)
+        return "mouse", button, f"mouse:{button}"
+    return "keyboard", raw, raw
+
+
+def parse_loop_interval(value: Any) -> float:
+    try:
+        interval = float(value)
+    except Exception:
+        raise ValueError(f"\u5faa\u73af\u95f4\u9694\u5fc5\u987b\u662f\u6570\u5b57\uff0c\u6536\u5230\uff1a{value!r}")
+    if interval < 0:
+        raise ValueError("\u5faa\u73af\u95f4\u9694\u4e0d\u80fd\u5c0f\u4e8e 0")
+    if interval > 3600:
+        raise ValueError("\u5faa\u73af\u95f4\u9694\u8fc7\u5927\uff0c\u6700\u5927\u5141\u8bb8 3600 \u79d2")
+    return interval
+
 def clean_key_name(key: Any) -> str:
     k = str(key).strip().lower().replace("key.", "")
     if len(k) == 1:
@@ -112,7 +154,7 @@ def clean_key_name(key: Any) -> str:
     return KEY_MAP.get(k, k)
 
 
-def validate_and_normalize_event(raw: Dict[str, Any], hotkey_button: str) -> Dict[str, Any] | None:
+def validate_and_normalize_event(raw: Dict[str, Any], skip_hotkey_buttons: Set[str]) -> Dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     etype = raw.get("type")
@@ -131,7 +173,7 @@ def validate_and_normalize_event(raw: Dict[str, Any], hotkey_button: str) -> Dic
 
     if etype == "mouse_click":
         btn = normalize_button_name(data.get("button", "left"))
-        if SKIP_HOTKEY_MOUSE_EVENTS and btn == hotkey_button:
+        if SKIP_HOTKEY_MOUSE_EVENTS and btn in skip_hotkey_buttons:
             return None
         if btn not in MOUSE_BUTTON_MAP:
             print(f"[FILTER] 跳过未知鼠标按钮：{btn}", flush=True)
@@ -173,10 +215,19 @@ def validate_and_normalize_event(raw: Dict[str, Any], hotkey_button: str) -> Dic
     return None
 
 
-def load_macro(path: Path, hotkey_button: str) -> List[Dict[str, Any]]:
+def load_macro(path: Path, hotkey_button: str | None, loop_interval: float) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     raw_events = payload.get("events", [])
+    skip_hotkey_buttons: Set[str] = set()
+    if hotkey_button:
+        skip_hotkey_buttons.add(hotkey_button)
+    try:
+        recorded_kind, recorded_value, _recorded_display = parse_hotkey_config(payload.get("record_hotkey", ""))
+        if recorded_kind == "mouse":
+            skip_hotkey_buttons.add(recorded_value)
+    except Exception:
+        pass
     if not isinstance(raw_events, list):
         raise ValueError("JSON 格式错误：events 不是列表")
 
@@ -184,12 +235,12 @@ def load_macro(path: Path, hotkey_button: str) -> List[Dict[str, Any]]:
     skipped = 0
     for raw in raw_events:
         before_len = len(normalized)
-        event = validate_and_normalize_event(raw, hotkey_button)
+        event = validate_and_normalize_event(raw, skip_hotkey_buttons)
         if event is not None:
             normalized.append(event)
         elif isinstance(raw, dict) and raw.get("type") == "mouse_click":
             btn = normalize_button_name((raw.get("data") or {}).get("button", ""))
-            if btn == hotkey_button:
+            if btn in skip_hotkey_buttons:
                 skipped += 1
         elif len(normalized) == before_len:
             skipped += 1
@@ -210,7 +261,7 @@ def load_macro(path: Path, hotkey_button: str) -> List[Dict[str, Any]]:
         flush=True,
     )
     print(f"[FIX] 已去掉启动前摇：{original_first_t:.3f}s；第一条事件现在 t=0，按热键后立即执行。", flush=True)
-    print(f"[LOAD] 宏时长：{duration:.3f}s；循环间隔：{LOOP_INTERVAL_SECONDS:.3f}s", flush=True)
+    print(f"[LOAD] \u5b8f\u65f6\u957f\uff1a{duration:.3f}s\uff1b\u5faa\u73af\u95f4\u9694\uff1a{loop_interval:.3f}s", flush=True)
     print(f"[LOAD] 首条事件：{normalized[0]}", flush=True)
     return normalized
 
@@ -313,8 +364,8 @@ def playback_worker(events: List[Dict[str, Any]], state: RuntimeState, hotkey_bu
         safe_release_all(state)
         if state.enabled.is_set() and not state.quit.is_set():
             state.loop_count += 1
-            print(f"[LOOP] 第 {state.loop_count} 次完成，间隔 {LOOP_INTERVAL_SECONDS:.3f}s", flush=True)
-            interruptible_sleep(LOOP_INTERVAL_SECONDS, state)
+            print(f"[LOOP] \u7b2c {state.loop_count} \u6b21\u5b8c\u6210\uff0c\u95f4\u9694 {loop_interval:.3f}s", flush=True)
+            interruptible_sleep(loop_interval, state)
 
 
 def pynput_hotkey_listener_worker(state: RuntimeState, hotkey_button: str) -> None:
@@ -339,6 +390,25 @@ def pynput_hotkey_listener_worker(state: RuntimeState, hotkey_button: str) -> No
         listener.stop()
 
 
+
+def keyboard_hotkey_listener_worker(state: RuntimeState, hotkey: str) -> None:
+    if pynput_keyboard is None:
+        print("[HOTKEY ERROR] \u672a\u5b89\u88c5 pynput\uff0c\u65e0\u6cd5\u76d1\u542c\u952e\u76d8\u70ed\u952e\uff1apython -m pip install pynput", flush=True)
+        return
+    try:
+        listener = pynput_keyboard.GlobalHotKeys({hotkey: state.toggle})
+    except Exception as exc:
+        print(f"[HOTKEY ERROR] \u952e\u76d8\u70ed\u952e\u683c\u5f0f\u65e0\u6548\uff1a{hotkey} -> {exc}", flush=True)
+        return
+    print(f"[HOTKEY] pynput \u6b63\u5728\u76d1\u542c\u952e\u76d8\u70ed\u952e {hotkey}\u3002", flush=True)
+    listener.start()
+    try:
+        while not state.quit.is_set():
+            time.sleep(0.05)
+    finally:
+        listener.stop()
+
+
 def self_check(events: List[Dict[str, Any]]) -> None:
     issues = []
     if events[0]["t"] != 0:
@@ -360,36 +430,57 @@ def self_check(events: List[Dict[str, Any]]) -> None:
         print("[SELF-CHECK] 通过：时间轴、事件类型、按钮/按键字段正常。", flush=True)
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Interception \u5faa\u73af\u5b8f\u56de\u653e\u5668")
+    parser.add_argument("macro_json", nargs="?", default=str(MACRO_JSON), help="\u5b8f\u5f55\u5236 JSON \u6587\u4ef6\u8def\u5f84")
+    parser.add_argument("--hotkey", default=TOGGLE_HOTKEY, help="\u542f\u52a8/\u6682\u505c\u70ed\u952e\uff0c\u4f8b\u5982 mouse:x1\u3001mouse:x2\u3001<ctrl>+<shift>+r")
+    parser.add_argument("--interval", type=float, default=LOOP_INTERVAL_SECONDS, help="\u6bcf\u8f6e\u5faa\u73af\u7ed3\u675f\u540e\u7684\u95f4\u9694\u79d2\u6570")
+    return parser
+
+
 def main() -> int:
-    macro_path = Path(sys.argv[1]) if len(sys.argv) >= 2 else MACRO_JSON
+    configure_console_encoding()
+    args = build_arg_parser().parse_args()
+    macro_path = Path(args.macro_json)
     if not macro_path.exists():
-        print(f"[ERROR] 找不到宏文件：{macro_path}", flush=True)
+        print(f"[ERROR] \u627e\u4e0d\u5230\u5b8f\u6587\u4ef6\uff1a{macro_path}", flush=True)
         return 2
 
-    hotkey_button = normalize_mouse_hotkey(TOGGLE_HOTKEY)
-    events = load_macro(macro_path, hotkey_button)
+    try:
+        hotkey_kind, hotkey_value, hotkey_display = parse_hotkey_config(args.hotkey)
+        loop_interval = parse_loop_interval(args.interval)
+    except Exception as exc:
+        print(f"[ERROR] \u53c2\u6570\u9519\u8bef\uff1a{exc}", flush=True)
+        return 3
+
+    hotkey_button_for_filter = hotkey_value if hotkey_kind == "mouse" else None
+    events = load_macro(macro_path, hotkey_button_for_filter, loop_interval)
     self_check(events)
 
-    print(f"[CONFIG] 热键：{TOGGLE_HOTKEY}", flush=True)
-    print(f"[CONFIG] 热键监听：{HOTKEY_BACKEND}", flush=True)
-    print("[CONFIG] 回放引擎：Interception", flush=True)
+    print(f"[CONFIG] ???{hotkey_display}", flush=True)
+    print(f"[CONFIG] \u5faa\u73af\u95f4\u9694\uff1a{loop_interval:.3f}s", flush=True)
+    print(f"[CONFIG] \u70ed\u952e\u76d1\u542c\uff1a{HOTKEY_BACKEND}/{hotkey_kind}", flush=True)
+    print("[CONFIG] \u56de\u653e\u5f15\u64ce\uff1aInterception", flush=True)
 
     try:
         interception.auto_capture_devices(keyboard=True, mouse=True, verbose=False)
-        print("[CHECK] Interception 设备初始化完成。", flush=True)
+        print("[CHECK] Interception \u8bbe\u5907\u521d\u59cb\u5316\u5b8c\u6210\u3002", flush=True)
     except Exception as exc:
-        print(f"[WARN] Interception 自动设备初始化失败：{type(exc).__name__}: {exc}", flush=True)
-        print("[WARN] 将继续使用默认设备；如果回放无动作，需要检查 Interception 驱动/管理员权限。", flush=True)
+        print(f"[WARN] Interception \u81ea\u52a8\u8bbe\u5907\u521d\u59cb\u5316\u5931\u8d25\uff1a{type(exc).__name__}: {exc}", flush=True)
+        print("[WARN] \u5c06\u7ee7\u7eed\u4f7f\u7528\u9ed8\u8ba4\u8bbe\u5907\uff1b\u5982\u679c\u56de\u653e\u65e0\u52a8\u4f5c\uff0c\u9700\u8981\u68c0\u67e5 Interception \u9a71\u52a8/\u7ba1\u7406\u5458\u6743\u9650\u3002", flush=True)
 
-    state = RuntimeState()
-    hotkey_thread = threading.Thread(
-        target=pynput_hotkey_listener_worker,
-        args=(state, hotkey_button),
-        daemon=True,
-    )
+    state = RuntimeState(hotkey_display=hotkey_display)
+    if hotkey_kind == "mouse":
+        hotkey_target = pynput_hotkey_listener_worker
+        hotkey_args = (state, hotkey_value)
+    else:
+        hotkey_target = keyboard_hotkey_listener_worker
+        hotkey_args = (state, hotkey_value)
+
+    hotkey_thread = threading.Thread(target=hotkey_target, args=hotkey_args, daemon=True)
     play_thread = threading.Thread(
         target=playback_worker,
-        args=(events, state, hotkey_button),
+        args=(events, state, hotkey_display, loop_interval),
         daemon=True,
     )
     hotkey_thread.start()
@@ -399,14 +490,13 @@ def main() -> int:
         while True:
             time.sleep(0.25)
     except KeyboardInterrupt:
-        print("\n[EXIT] 正在退出……", flush=True)
+        print("\n[EXIT] \u6b63\u5728\u9000\u51fa\u2026\u2026", flush=True)
         state.quit.set()
         state.enabled.set()
         safe_release_all(state)
         hotkey_thread.join(timeout=1.0)
         play_thread.join(timeout=1.0)
         return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

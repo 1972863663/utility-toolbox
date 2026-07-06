@@ -2355,6 +2355,8 @@ class MacroToolsTab:
         self.parent = parent
         self.status_callback = status_callback
         self.macro_json_var = tk.StringVar(value=str(Path.home() / "Desktop" / "macro_recording.json"))
+        self.loop_hotkey_var = tk.StringVar(value="mouse:x1")
+        self.loop_interval_var = tk.StringVar(value="0.1")
         self._build()
 
     def _build(self) -> None:
@@ -2365,7 +2367,7 @@ class MacroToolsTab:
         title.pack(anchor=tk.W, pady=(0, 8))
         desc = ttk.Label(
             outer,
-            text="\u5f55\u5236\u9f20\u6807\u548c\u952e\u76d8\u64cd\u4f5c\uff0c\u5bfc\u51fa JSON\uff1b\u4f7f\u7528 Interception \u5faa\u73af\u56de\u653e\u3002\u9ed8\u8ba4 mouse:x1 \u5f00\u59cb/\u6682\u505c\uff0c\u5faa\u73af\u95f4\u9694 0.1 \u79d2\u3002",
+            text="\u5f55\u5236\u9f20\u6807\u548c\u952e\u76d8\u64cd\u4f5c\uff0c\u5bfc\u51fa JSON\uff1b\u4f7f\u7528 Interception \u5faa\u73af\u56de\u653e\u3002\u542f\u52a8/\u6682\u505c\u70ed\u952e\u548c\u5faa\u73af\u95f4\u9694\u90fd\u53ef\u81ea\u5b9a\u4e49\u3002",
             wraplength=980,
         )
         desc.pack(anchor=tk.W, fill=tk.X, pady=(0, 16))
@@ -2376,6 +2378,16 @@ class MacroToolsTab:
         ttk.Entry(path_box, textvariable=self.macro_json_var).grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
         ttk.Button(path_box, text="\u9009\u62e9 JSON", command=self.choose_macro_json).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(path_box, text="\u6253\u5f00\u6240\u5728\u76ee\u5f55", command=self.open_macro_json_folder).grid(row=0, column=2)
+
+        settings_box = ttk.LabelFrame(outer, text="\u56de\u653e\u8bbe\u7f6e", padding=12)
+        settings_box.pack(fill=tk.X, pady=(0, 14))
+        settings_box.columnconfigure(1, weight=1)
+        settings_box.columnconfigure(3, weight=1)
+        ttk.Label(settings_box, text="\u542f\u52a8/\u6682\u505c\u70ed\u952e\uff1a").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        ttk.Entry(settings_box, textvariable=self.loop_hotkey_var, width=24).grid(row=0, column=1, sticky=tk.EW, padx=(0, 18))
+        ttk.Label(settings_box, text="\u5faa\u73af\u95f4\u9694\uff08\u79d2\uff09\uff1a").grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        ttk.Entry(settings_box, textvariable=self.loop_interval_var, width=12).grid(row=0, column=3, sticky=tk.EW)
+        ttk.Label(settings_box, text="\u793a\u4f8b\uff1amouse:x1\u3001mouse:x2\u3001<ctrl>+<shift>+r\uff1b\u95f4\u9694\u53ef\u586b 0\u30010.1\u30011.5", foreground=THEME["muted"]).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
 
         actions = ttk.LabelFrame(outer, text="\u64cd\u4f5c", padding=12)
         actions.pack(fill=tk.X, pady=(0, 14))
@@ -2392,7 +2404,7 @@ class MacroToolsTab:
         info.pack(fill=tk.BOTH, expand=True)
         text = (
             "1. \u5f55\u5236\u5668\u9ed8\u8ba4 Ctrl+Shift+R \u5f00\u59cb/\u505c\u6b62\uff0c\u4e5f\u652f\u6301\u6355\u83b7 mouse:x1 / mouse:x2\u3002\n"
-            "2. \u5faa\u73af\u56de\u653e\u5668\u9ed8\u8ba4\u8bfb\u53d6\u4e0a\u65b9 JSON\uff0cmouse:x1 \u5f00\u542f/\u6682\u505c\u3002\n"
+            "2. \u5faa\u73af\u56de\u653e\u5668\u8bfb\u53d6\u4e0a\u65b9 JSON\uff0c\u542f\u52a8/\u6682\u505c\u70ed\u952e\u548c\u5faa\u73af\u95f4\u9694\u53ef\u5728\u754c\u9762\u4e2d\u4fee\u6539\u3002\n"
             "3. \u5faa\u73af\u811a\u672c\u5df2\u53bb\u6389\u5f55\u5236\u5f00\u59cb\u540e\u7684\u524d\u6447\u7b49\u5f85\uff1a\u7b2c\u4e00\u6761\u6709\u6548\u52a8\u4f5c\u4f1a\u7acb\u5373\u6267\u884c\u3002\n"
             "4. \u5982\u679c Interception \u56de\u653e\u65e0\u52a8\u4f5c\uff0c\u901a\u5e38\u662f\u9a71\u52a8\u3001\u6743\u9650\u6216\u8bbe\u5907\u8bc6\u522b\u95ee\u9898\uff1b\u70ed\u952e\u76d1\u542c\u5df2\u4f7f\u7528 pynput\uff0c\u56de\u653e\u4ecd\u4f7f\u7528 Interception\u3002"
         )
@@ -2476,19 +2488,32 @@ class MacroToolsTab:
         except Exception as exc:
             messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u65e0\u6cd5\u542f\u52a8\u5b8f\u5f55\u5236\u5668\uff1a{exc}")
 
+    def loop_settings(self) -> Tuple[str, float]:
+        hotkey = self.loop_hotkey_var.get().strip() or "mouse:x1"
+        try:
+            interval = float((self.loop_interval_var.get().strip() or "0.1"))
+        except ValueError:
+            raise ValueError("\u5faa\u73af\u95f4\u9694\u5fc5\u987b\u662f\u6570\u5b57")
+        if interval < 0:
+            raise ValueError("\u5faa\u73af\u95f4\u9694\u4e0d\u80fd\u5c0f\u4e8e 0")
+        if interval > 3600:
+            raise ValueError("\u5faa\u73af\u95f4\u9694\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 3600 \u79d2")
+        return hotkey, interval
+
     def launch_loop_player(self) -> None:
         macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
         if not Path(macro_json).exists():
             messagebox.showerror("\u5b8f\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u627e\u4e0d\u5230\u5b8f JSON\uff1a\n{macro_json}")
             return
         try:
+            hotkey, interval = self.loop_settings()
             self._launch_exe_or_script(
                 "interception_loop_macro.exe",
                 "interception_loop_macro.py",
-                args=[macro_json],
+                args=[macro_json, "--hotkey", hotkey, "--interval", str(interval)],
                 new_console=True,
             )
-            self.status_callback("\u5df2\u542f\u52a8 Interception \u5faa\u73af\u56de\u653e")
+            self.status_callback(f"\u5df2\u542f\u52a8 Interception \u5faa\u73af\u56de\u653e\uff1b\u70ed\u952e {hotkey}\uff0c\u95f4\u9694 {interval:g}s")
         except Exception as exc:
             messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u65e0\u6cd5\u542f\u52a8\u5faa\u73af\u56de\u653e\uff1a{exc}")
 
@@ -2529,9 +2554,11 @@ class MacroToolsTab:
         script = folder / "interception_loop_macro.py"
         exe = folder / "interception_loop_macro.exe"
         macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
+        hotkey, interval = self.loop_settings()
         desktop = Path.home() / "Desktop"
         bat = desktop / "run_interception_macro.bat"
-        command = f'"{exe}" "{macro_json}"' if exe.exists() else f'python "{script}" "{macro_json}"'
+        extra = f' --hotkey "{hotkey}" --interval "{interval:g}"'
+        command = f'"{exe}" "{macro_json}"{extra}' if exe.exists() else f'python "{script}" "{macro_json}"{extra}'
         content = (
             "@echo off\n"
             "chcp 65001 >nul\n"
