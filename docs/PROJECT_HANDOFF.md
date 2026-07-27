@@ -157,7 +157,7 @@ mic_tool_workspace\dist\Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe
 | `BackupMonitorTab` | `utility_toolbox.py` | 存档/文件夹备份监控。 |
 | `AudioSwitchTab` | `utility_toolbox.py` | 默认音频输出设备切换，使用 Windows Core Audio COM 接口。 |
 | `LiveShortcutTab` | `utility_toolbox.py` | 直播快捷入口，自动打开配置项。 |
-| `SystemToolsTab` | `utility_toolbox.py` | 系统工具：管理员 PowerShell、启动/关闭麦克风悬浮窗。 |
+| `SystemToolsTab` | `utility_toolbox.py` | 系统工具：管理员 PowerShell 7（`pwsh.exe`）、启动/关闭麦克风悬浮窗。 |
 | `FpsOverlayTab` | `utility_toolbox.py` | 部署、启动、重启、关闭 TinyFpsOverlay，显示状态并集中管理原托盘设置。 |
 | `StartupTab` | `utility_toolbox.py` | 开机启动配置，写入 Windows Run 注册表项。 |
 | `LauncherTab` | `utility_toolbox.py` | 应用启动器，支持拖拽启动并按路径关闭进程。 |

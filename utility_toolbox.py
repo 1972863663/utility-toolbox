@@ -671,6 +671,20 @@ def resource_path(*parts: str) -> Path:
     return base.joinpath(*parts)
 
 
+def powershell7_executable() -> Optional[str]:
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PowerShell" / "7" / "pwsh.exe",
+        Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        / "Microsoft"
+        / "WindowsApps"
+        / "pwsh.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("pwsh.exe")
+
+
 def app_icon_path() -> Path:
     return resource_path("icons", APP_ICON_FILE)
 
@@ -1883,8 +1897,8 @@ class SystemToolsTab:
         ttk.Label(frame, text="系统工具", font=("Microsoft YaHei UI", scaled(18, self.scale), "bold")).pack(anchor=tk.W)
         ttk.Button(
             frame,
-            text="管理员运行 Windows PowerShell",
-            command=self.open_admin_powershell,
+            text="管理员运行 PowerShell 7",
+            command=self.open_admin_powershell7,
         ).pack(anchor=tk.W, pady=(scaled(16, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
         ttk.Button(
             frame,
@@ -1897,14 +1911,24 @@ class SystemToolsTab:
             command=self.close_mic_toggle,
         ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
 
-    def open_admin_powershell(self) -> None:
+    def open_admin_powershell7(self) -> None:
         try:
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", None, r"C:\Windows\System32", 1)
+            executable = powershell7_executable()
+            if not executable:
+                raise FileNotFoundError("找不到 pwsh.exe，请先安装 PowerShell 7")
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                executable,
+                None,
+                str(Path.home()),
+                1,
+            )
             if result <= 32:
                 raise OSError(f"ShellExecuteW failed: {result}")
-            self.status_callback("已请求管理员权限启动 Windows PowerShell")
+            self.status_callback("已请求管理员权限启动 PowerShell 7")
         except Exception as exc:
-            messagebox.showerror("启动失败", f"无法以管理员身份启动 Windows PowerShell：{exc}")
+            messagebox.showerror("启动失败", f"无法以管理员身份启动 PowerShell 7：{exc}")
 
     def open_mic_toggle(self) -> None:
         if self._running_mic_processes():
