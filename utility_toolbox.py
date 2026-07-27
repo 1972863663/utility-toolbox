@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import queue
 import shutil
@@ -18,7 +19,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -56,6 +57,21 @@ AUTOSTART_ARG = "--minimized-to-tray"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "UtilityToolbox"
 APP_ICON_FILE = "utility_toolbox.ico"
+FPS_OVERLAY_PROCESS_NAME = "TinyFpsOverlay.exe"
+FPS_OVERLAY_RESOURCE_DIR = "fps_overlay"
+FPS_OVERLAY_MANAGED_ARG = "--toolbox-managed"
+FPS_OVERLAY_INSTALL_DIR = Path(
+    os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
+) / "UtilityToolbox" / FPS_OVERLAY_RESOURCE_DIR
+FPS_OVERLAY_CONFIG_DIR = Path(
+    os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")
+) / "TinyFpsOverlay"
+FPS_OVERLAY_CONFIG_FILE = FPS_OVERLAY_CONFIG_DIR / "config.json"
+FPS_OVERLAY_RUN_VALUE_NAME = "TinyFpsOverlay"
+FPS_OVERLAY_REQUIRED_FILES = (
+    Path(FPS_OVERLAY_PROCESS_NAME),
+    Path("tools") / "PresentMon-2.5.1-x64.exe",
+)
 LAUNCHER_CLOSE_EXTENSIONS = {".exe", ".bat", ".cmd", ".py", ".ps1", ".lnk"}
 PROCESS_EXECUTABLE_EXTENSIONS = {".exe"}
 DIRECTORY_SCOPE_KEYWORDS = ("launcher", "runner", "start", "auto", "启动器", "启动")
@@ -423,6 +439,220 @@ def close_mic_toggle_processes() -> Tuple[int, Dict[int, str]]:
     pids = [pid for pid, _name, _path in processes]
     closed, failures = terminate_processes_fast(pids)
     return len(closed), failures
+
+
+def running_fps_overlay_processes() -> List[Tuple[int, str, str]]:
+    matches: List[Tuple[int, str, str]] = []
+    current_pid = os.getpid()
+    try:
+        for pid, path in running_process_paths():
+            if not pid or pid == current_pid:
+                continue
+            name = Path(path).name
+            if name.casefold() == FPS_OVERLAY_PROCESS_NAME.casefold():
+                matches.append((pid, name, path))
+    except Exception:
+        return []
+    return matches
+
+
+def close_fps_overlay_processes() -> Tuple[int, Dict[int, str]]:
+    processes = running_fps_overlay_processes()
+    if not processes:
+        return 0, {}
+    pids = [pid for pid, _name, _path in processes]
+    closed, failures = terminate_processes_fast(pids)
+    return len(closed), failures
+
+
+def files_have_same_content(left: Path, right: Path) -> bool:
+    def sha256(path: Path) -> bytes:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.digest()
+
+    try:
+        if not left.is_file() or not right.is_file() or left.stat().st_size != right.stat().st_size:
+            return False
+        return sha256(left) == sha256(right)
+    except OSError:
+        return False
+
+
+def install_fps_overlay_runtime(
+    source_dir: Optional[Path] = None,
+    install_dir: Optional[Path] = None,
+) -> Path:
+    source = source_dir or resource_path(FPS_OVERLAY_RESOURCE_DIR)
+    destination = install_dir or FPS_OVERLAY_INSTALL_DIR
+    missing = [str(relative) for relative in FPS_OVERLAY_REQUIRED_FILES if not (source / relative).is_file()]
+    if missing:
+        raise FileNotFoundError("帧率监测组件不完整，缺少：" + "、".join(missing))
+
+    try:
+        if source.resolve() == destination.resolve():
+            return destination / FPS_OVERLAY_PROCESS_NAME
+    except OSError:
+        pass
+
+    for relative in FPS_OVERLAY_REQUIRED_FILES:
+        source_file = source / relative
+        target_file = destination / relative
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        if files_have_same_content(source_file, target_file):
+            continue
+        try:
+            shutil.copy2(source_file, target_file)
+        except OSError:
+            # 正在运行的旧版本可能暂时锁定 EXE。只要现有运行时完整，就继续使用；
+            # 下次关闭悬浮窗再启动时会自动完成更新。
+            if not target_file.is_file():
+                raise
+
+    executable = destination / FPS_OVERLAY_PROCESS_NAME
+    present_mon = destination / "tools" / "PresentMon-2.5.1-x64.exe"
+    if not executable.is_file() or not present_mon.is_file():
+        raise FileNotFoundError("帧率监测运行时部署失败")
+    return executable
+
+
+FPS_OVERLAY_CONFIG_DEFAULTS = {
+    "Left": -1,
+    "Top": 0,
+    "LockedClickThrough": True,
+    "Opacity": 1.0,
+    "HotkeyEnabled": True,
+    "ShowHotkeyKey": 0xDB,
+    "ShowHotkeyModifiers": 0,
+    "HideHotkeyKey": 0xDD,
+    "HideHotkeyModifiers": 0,
+    "AutoStartEnabled": False,
+    "TextColorArgb": -5570816,
+    "TextWeight": 0,
+    "TextScale": 100,
+}
+
+FPS_HOTKEY_KEY_CODES = {
+    "[": 0xDB,
+    "]": 0xDD,
+    ",": 0xBC,
+    ".": 0xBE,
+    "-": 0xBD,
+    "=": 0xBB,
+    "/": 0xBF,
+    "\\": 0xDC,
+    ";": 0xBA,
+    "'": 0xDE,
+    "`": 0xC0,
+    "SPACE": 0x20,
+    "ESC": 0x1B,
+    "ESCAPE": 0x1B,
+    "TAB": 0x09,
+    "ENTER": 0x0D,
+    "UP": 0x26,
+    "DOWN": 0x28,
+    "LEFT": 0x25,
+    "RIGHT": 0x27,
+    "HOME": 0x24,
+    "END": 0x23,
+    "PAGEUP": 0x21,
+    "PAGEDOWN": 0x22,
+    "INSERT": 0x2D,
+    "DELETE": 0x2E,
+}
+FPS_HOTKEY_KEY_NAMES = {
+    value: key.title() if len(key) > 1 else key
+    for key, value in FPS_HOTKEY_KEY_CODES.items()
+    if key not in {"ESCAPE"}
+}
+FPS_HOTKEY_KEY_NAMES[0x1B] = "Esc"
+
+
+def load_fps_overlay_config() -> Dict:
+    config = dict(FPS_OVERLAY_CONFIG_DEFAULTS)
+    try:
+        with FPS_OVERLAY_CONFIG_FILE.open("r", encoding="utf-8-sig") as handle:
+            saved = json.load(handle)
+        if isinstance(saved, dict):
+            config.update(saved)
+    except (OSError, ValueError):
+        pass
+    return config
+
+
+def save_fps_overlay_config(config: Dict) -> None:
+    FPS_OVERLAY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = dict(config)
+    temp_file = FPS_OVERLAY_CONFIG_FILE.with_suffix(".json.tmp")
+    with temp_file.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(temp_file, FPS_OVERLAY_CONFIG_FILE)
+
+
+def parse_fps_hotkey(value: str) -> Tuple[int, int]:
+    parts = [part.strip() for part in value.split("+") if part.strip()]
+    if not parts:
+        raise ValueError("热键不能为空")
+
+    modifiers = 0
+    modifier_names = {"CTRL": 0x0002, "CONTROL": 0x0002, "ALT": 0x0001, "SHIFT": 0x0004, "WIN": 0x0008, "WINDOWS": 0x0008}
+    for part in parts[:-1]:
+        key = part.upper()
+        if key not in modifier_names:
+            raise ValueError(f"不支持的修饰键：{part}")
+        modifiers |= modifier_names[key]
+
+    key_name = parts[-1].upper()
+    if len(key_name) == 1 and key_name.isalnum():
+        key_code = ord(key_name)
+    elif key_name.startswith("F") and key_name[1:].isdigit() and 1 <= int(key_name[1:]) <= 24:
+        key_code = 0x70 + int(key_name[1:]) - 1
+    else:
+        key_code = FPS_HOTKEY_KEY_CODES.get(key_name, 0)
+    if not key_code:
+        raise ValueError(f"不支持的按键：{parts[-1]}")
+    return modifiers, key_code
+
+
+def format_fps_hotkey(modifiers: int, key_code: int) -> str:
+    parts: List[str] = []
+    for bit, name in ((0x0002, "Ctrl"), (0x0001, "Alt"), (0x0004, "Shift"), (0x0008, "Win")):
+        if modifiers & bit:
+            parts.append(name)
+    if 0x30 <= key_code <= 0x39 or 0x41 <= key_code <= 0x5A:
+        key_name = chr(key_code)
+    elif 0x70 <= key_code <= 0x87:
+        key_name = f"F{key_code - 0x70 + 1}"
+    else:
+        key_name = FPS_HOTKEY_KEY_NAMES.get(key_code, f"VK_{key_code:02X}")
+    parts.append(key_name)
+    return "+".join(parts)
+
+
+def fps_argb_to_hex(argb: int) -> str:
+    return f"#{int(argb) & 0xFFFFFF:06X}"
+
+
+def fps_hex_to_argb(color: str) -> int:
+    rgb = int(color.lstrip("#"), 16) & 0xFFFFFF
+    unsigned = 0xFF000000 | rgb
+    return unsigned - 0x100000000 if unsigned >= 0x80000000 else unsigned
+
+
+def set_fps_overlay_autostart(enabled: bool, executable: Path) -> None:
+    import winreg
+
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as handle:
+        if enabled:
+            command = f'"{executable}" {FPS_OVERLAY_MANAGED_ARG}'
+            winreg.SetValueEx(handle, FPS_OVERLAY_RUN_VALUE_NAME, 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(handle, FPS_OVERLAY_RUN_VALUE_NAME)
+            except FileNotFoundError:
+                pass
 
 
 def current_scale(root: tk.Tk) -> float:
@@ -1789,6 +2019,389 @@ class SystemToolsTab:
             return []
 
 
+class FpsOverlayTab:
+    def __init__(self, parent: ttk.Frame, status_callback: Callable[[str], None]):
+        self.parent = parent
+        self.status_callback = status_callback
+        self.scale = current_scale(parent.winfo_toplevel())
+        self.status_var = tk.StringVar(value="正在检测运行状态…")
+        self.path_var = tk.StringVar(value=f"稳定运行目录：{FPS_OVERLAY_INSTALL_DIR}")
+        self.overlay_config = load_fps_overlay_config()
+        self.hotkey_enabled_var = tk.BooleanVar(value=bool(self.overlay_config.get("HotkeyEnabled", True)))
+        self.show_hotkey_var = tk.StringVar(
+            value=format_fps_hotkey(
+                int(self.overlay_config.get("ShowHotkeyModifiers", 0)),
+                int(self.overlay_config.get("ShowHotkeyKey", 0xDB)),
+            )
+        )
+        self.hide_hotkey_var = tk.StringVar(
+            value=format_fps_hotkey(
+                int(self.overlay_config.get("HideHotkeyModifiers", 0)),
+                int(self.overlay_config.get("HideHotkeyKey", 0xDD)),
+            )
+        )
+        self.autostart_var = tk.BooleanVar(value=bool(self.overlay_config.get("AutoStartEnabled", False)))
+        self.text_color = fps_argb_to_hex(int(self.overlay_config.get("TextColorArgb", -5570816)))
+        self.text_scale_var = tk.DoubleVar(value=max(80, min(180, int(self.overlay_config.get("TextScale", 100)))))
+        self.text_weight_var = tk.DoubleVar(value=max(0, min(100, int(self.overlay_config.get("TextWeight", 0)))))
+        self.opacity_var = tk.DoubleVar(
+            value=max(35, min(100, round(float(self.overlay_config.get("Opacity", 1.0)) * 100)))
+        )
+        self.text_scale_value_var = tk.StringVar()
+        self.text_weight_value_var = tk.StringVar()
+        self.opacity_value_var = tk.StringVar()
+        self.refresh_job: Optional[str] = None
+        self._build()
+        self._refresh_slider_labels()
+        self._schedule_refresh()
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self.parent, padding=scaled(18, self.scale))
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        title = ttk.Label(
+            outer,
+            text="游戏帧率与硬件监测",
+            font=("Microsoft YaHei UI", scaled(20, self.scale), "bold"),
+        )
+        title.pack(anchor=tk.W, fill=tk.X)
+        bind_wrap(outer, title)
+
+        description = ttk.Label(
+            outer,
+            text=(
+                "启动后会在屏幕顶部居中显示 FPS、CPU 占用/温度和 GPU 占用/温度。"
+                "悬浮条默认鼠标穿透，不会挡住游戏点击。"
+            ),
+        )
+        description.pack(anchor=tk.W, fill=tk.X, pady=(scaled(8, self.scale), 0))
+        bind_wrap(outer, description)
+
+        status_box = ttk.LabelFrame(outer, text="运行状态", padding=scaled(14, self.scale))
+        status_box.pack(fill=tk.X, pady=(scaled(18, self.scale), 0))
+        ttk.Label(
+            status_box,
+            textvariable=self.status_var,
+            font=("Microsoft YaHei UI", scaled(14, self.scale), "bold"),
+        ).pack(anchor=tk.W)
+        path_label = ttk.Label(status_box, textvariable=self.path_var, foreground=THEME["muted"])
+        path_label.pack(anchor=tk.W, fill=tk.X, pady=(scaled(6, self.scale), 0))
+        bind_wrap(status_box, path_label)
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill=tk.X, pady=(scaled(18, self.scale), 0))
+        ttk.Button(actions, text="启动帧率监测", command=self.start_overlay).pack(
+            side=tk.LEFT,
+            padx=(0, scaled(10, self.scale)),
+            ipadx=scaled(18, self.scale),
+            ipady=scaled(8, self.scale),
+        )
+        ttk.Button(actions, text="重启", command=self.restart_overlay).pack(
+            side=tk.LEFT,
+            padx=(0, scaled(10, self.scale)),
+            ipadx=scaled(12, self.scale),
+            ipady=scaled(8, self.scale),
+        )
+        ttk.Button(actions, text="关闭", command=self.close_overlay).pack(
+            side=tk.LEFT,
+            padx=(0, scaled(10, self.scale)),
+            ipadx=scaled(12, self.scale),
+            ipady=scaled(8, self.scale),
+        )
+        ttk.Button(actions, text="打开配置目录", command=self.open_config_folder).pack(
+            side=tk.LEFT,
+            ipadx=scaled(12, self.scale),
+            ipady=scaled(8, self.scale),
+        )
+
+        settings = ttk.LabelFrame(outer, text="悬浮条设置", padding=scaled(12, self.scale))
+        settings.pack(fill=tk.X, pady=(scaled(14, self.scale), 0))
+        settings.columnconfigure(1, weight=1)
+        settings.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(settings, text="开启显示/隐藏热键", variable=self.hotkey_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, padx=(0, 12), pady=4
+        )
+        ttk.Checkbutton(settings, text="开机自动启动帧率监测", variable=self.autostart_var).grid(
+            row=0, column=2, columnspan=2, sticky=tk.W, pady=4
+        )
+
+        ttk.Label(settings, text="显示热键").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(settings, textvariable=self.show_hotkey_var, width=18).grid(
+            row=1, column=1, sticky=tk.EW, padx=(8, 18), pady=4
+        )
+        ttk.Label(settings, text="隐藏热键").grid(row=1, column=2, sticky=tk.W, pady=4)
+        ttk.Entry(settings, textvariable=self.hide_hotkey_var, width=18).grid(
+            row=1, column=3, sticky=tk.EW, padx=(8, 0), pady=4
+        )
+
+        ttk.Label(settings, text="字体颜色").grid(row=2, column=0, sticky=tk.W, pady=4)
+        color_row = ttk.Frame(settings)
+        color_row.grid(row=2, column=1, sticky=tk.W, padx=(8, 18), pady=4)
+        ttk.Button(color_row, text="选择颜色…", command=self.choose_text_color).pack(side=tk.LEFT)
+        self.color_preview = tk.Label(
+            color_row,
+            width=4,
+            relief=tk.SOLID,
+            borderwidth=1,
+            background=self.text_color,
+        )
+        self.color_preview.pack(side=tk.LEFT, padx=(8, 0), ipady=3)
+        ttk.Label(settings, text="热键示例：Ctrl+Alt+F10、[、]").grid(
+            row=2, column=2, columnspan=2, sticky=tk.W, padx=(0, 0), pady=4
+        )
+
+        ttk.Label(settings, text="字体大小").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Scale(
+            settings,
+            from_=80,
+            to=180,
+            variable=self.text_scale_var,
+            command=lambda _value: self._refresh_slider_labels(),
+        ).grid(row=3, column=1, columnspan=2, sticky=tk.EW, padx=(8, 10), pady=4)
+        ttk.Label(settings, textvariable=self.text_scale_value_var, width=7, anchor=tk.E).grid(
+            row=3, column=3, sticky=tk.E, pady=4
+        )
+
+        ttk.Label(settings, text="字体粗细").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Scale(
+            settings,
+            from_=0,
+            to=100,
+            variable=self.text_weight_var,
+            command=lambda _value: self._refresh_slider_labels(),
+        ).grid(row=4, column=1, columnspan=2, sticky=tk.EW, padx=(8, 10), pady=4)
+        ttk.Label(settings, textvariable=self.text_weight_value_var, width=7, anchor=tk.E).grid(
+            row=4, column=3, sticky=tk.E, pady=4
+        )
+
+        ttk.Label(settings, text="透明度").grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Scale(
+            settings,
+            from_=35,
+            to=100,
+            variable=self.opacity_var,
+            command=lambda _value: self._refresh_slider_labels(),
+        ).grid(row=5, column=1, columnspan=2, sticky=tk.EW, padx=(8, 10), pady=4)
+        ttk.Label(settings, textvariable=self.opacity_value_var, width=7, anchor=tk.E).grid(
+            row=5, column=3, sticky=tk.E, pady=4
+        )
+
+        settings_actions = ttk.Frame(settings)
+        settings_actions.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
+        ttk.Button(settings_actions, text="保存设置并应用", command=self.apply_settings).pack(
+            side=tk.LEFT, ipadx=scaled(18, self.scale), ipady=scaled(5, self.scale)
+        )
+        ttk.Button(settings_actions, text="重新读取设置", command=self.reload_settings).pack(
+            side=tk.LEFT, padx=(scaled(10, self.scale), 0), ipadx=scaled(12, self.scale), ipady=scaled(5, self.scale)
+        )
+        ttk.Label(
+            settings_actions,
+            text="设置集中在工具箱；帧率监测不会再显示独立托盘图标。",
+            foreground=THEME["muted"],
+        ).pack(side=tk.LEFT, padx=(scaled(14, self.scale), 0))
+
+        requirements = ttk.Label(
+            outer,
+            text="保存设置后，正在运行的悬浮条会自动重启以应用改动。关闭工具箱不会中断监测。",
+            foreground=THEME["muted"],
+        )
+        requirements.pack(anchor=tk.W, fill=tk.X, pady=(scaled(14, self.scale), 0))
+        bind_wrap(outer, requirements)
+
+    def _refresh_slider_labels(self) -> None:
+        text_scale = max(80, min(180, round(float(self.text_scale_var.get()))))
+        text_weight = max(0, min(100, round(float(self.text_weight_var.get()))))
+        opacity = max(35, min(100, round(float(self.opacity_var.get()))))
+        self.text_scale_value_var.set(f"{text_scale}%")
+        self.text_weight_value_var.set(f"{text_weight}%")
+        self.opacity_value_var.set(f"{opacity}%")
+
+    def choose_text_color(self) -> None:
+        _rgb, selected = colorchooser.askcolor(
+            color=self.text_color,
+            title="选择帧率悬浮条字体颜色",
+            parent=self.parent,
+        )
+        if selected:
+            self.text_color = selected.upper()
+            self.color_preview.configure(background=self.text_color)
+
+    def _collect_settings(self) -> Dict:
+        show_modifiers, show_key = parse_fps_hotkey(self.show_hotkey_var.get())
+        hide_modifiers, hide_key = parse_fps_hotkey(self.hide_hotkey_var.get())
+        if show_modifiers == hide_modifiers and show_key == hide_key:
+            raise ValueError("显示热键和隐藏热键不能相同")
+
+        config = load_fps_overlay_config()
+        config.update(
+            {
+                "HotkeyEnabled": bool(self.hotkey_enabled_var.get()),
+                "ShowHotkeyKey": show_key,
+                "ShowHotkeyModifiers": show_modifiers,
+                "HideHotkeyKey": hide_key,
+                "HideHotkeyModifiers": hide_modifiers,
+                "AutoStartEnabled": bool(self.autostart_var.get()),
+                "TextColorArgb": fps_hex_to_argb(self.text_color),
+                "TextScale": max(80, min(180, round(float(self.text_scale_var.get())))),
+                "TextWeight": max(0, min(100, round(float(self.text_weight_var.get())))),
+                "Opacity": max(0.35, min(1.0, float(self.opacity_var.get()) / 100.0)),
+            }
+        )
+        return config
+
+    def apply_settings(self) -> None:
+        try:
+            config = self._collect_settings()
+            executable = install_fps_overlay_runtime()
+            save_fps_overlay_config(config)
+            set_fps_overlay_autostart(bool(config["AutoStartEnabled"]), executable)
+            self.overlay_config = config
+        except Exception as exc:
+            messagebox.showerror("设置保存失败", str(exc))
+            return
+
+        if running_fps_overlay_processes():
+            self.status_callback("设置已保存，正在重启帧率监测…")
+            self.restart_overlay()
+        else:
+            self.status_callback("帧率监测设置已保存")
+            messagebox.showinfo("设置已保存", "设置已保存，将在下次启动帧率监测时生效。")
+
+    def reload_settings(self) -> None:
+        config = load_fps_overlay_config()
+        self.overlay_config = config
+        self.hotkey_enabled_var.set(bool(config.get("HotkeyEnabled", True)))
+        self.show_hotkey_var.set(
+            format_fps_hotkey(int(config.get("ShowHotkeyModifiers", 0)), int(config.get("ShowHotkeyKey", 0xDB)))
+        )
+        self.hide_hotkey_var.set(
+            format_fps_hotkey(int(config.get("HideHotkeyModifiers", 0)), int(config.get("HideHotkeyKey", 0xDD)))
+        )
+        self.autostart_var.set(bool(config.get("AutoStartEnabled", False)))
+        self.text_color = fps_argb_to_hex(int(config.get("TextColorArgb", -5570816)))
+        self.color_preview.configure(background=self.text_color)
+        self.text_scale_var.set(max(80, min(180, int(config.get("TextScale", 100)))))
+        self.text_weight_var.set(max(0, min(100, int(config.get("TextWeight", 0)))))
+        self.opacity_var.set(max(35, min(100, round(float(config.get("Opacity", 1.0)) * 100))))
+        self._refresh_slider_labels()
+        self.status_callback("已重新读取帧率监测设置")
+
+    def _schedule_refresh(self) -> None:
+        if not self.parent.winfo_exists():
+            return
+        processes = running_fps_overlay_processes()
+        if processes:
+            pids = "、".join(str(pid) for pid, _name, _path in processes)
+            self.status_var.set(f"运行中（PID {pids}，设置由工具箱管理）")
+            self.path_var.set(f"程序位置：{processes[0][2]}")
+        else:
+            self.status_var.set("未运行")
+            self.path_var.set(f"稳定运行目录：{FPS_OVERLAY_INSTALL_DIR}")
+        self.refresh_job = self.parent.after(1500, self._schedule_refresh)
+
+    def start_overlay(self) -> None:
+        if running_fps_overlay_processes():
+            self.status_callback("帧率监测已在运行")
+            self._schedule_refresh_now()
+            return
+        self.status_var.set("正在部署并启动…")
+        threading.Thread(target=self._start_worker, daemon=True).start()
+
+    def _start_worker(self) -> None:
+        try:
+            executable = install_fps_overlay_runtime()
+            config = load_fps_overlay_config()
+            set_fps_overlay_autostart(bool(config.get("AutoStartEnabled", False)), executable)
+            subprocess.Popen(
+                [str(executable), FPS_OVERLAY_MANAGED_ARG],
+                cwd=str(executable.parent),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self.parent.after(0, lambda: self.status_callback("已启动帧率监测（无独立托盘图标）"))
+            self.parent.after(1200, self._schedule_refresh_now)
+        except Exception as exc:
+            self.parent.after(0, lambda e=exc: self._show_start_error(e))
+
+    def _show_start_error(self, exc: Exception) -> None:
+        self.status_var.set("启动失败")
+        messagebox.showerror(
+            "帧率监测启动失败",
+            f"无法启动 TinyFpsOverlay：\n{exc}\n\n若程序没有任何反应，请安装 .NET 8 Desktop Runtime。",
+        )
+
+    def close_overlay(self) -> None:
+        self.status_var.set("正在关闭…")
+        threading.Thread(target=self._close_worker, args=(False,), daemon=True).start()
+
+    def restart_overlay(self) -> None:
+        self.status_var.set("正在重启…")
+        threading.Thread(target=self._close_worker, args=(True,), daemon=True).start()
+
+    def _close_worker(self, restart: bool) -> None:
+        closed, failures = close_fps_overlay_processes()
+        if failures:
+            self.parent.after(0, lambda f=failures, r=restart: self._request_elevated_close(f, r))
+            return
+        if restart:
+            time.sleep(0.3)
+            self._start_worker()
+            return
+        message = f"已关闭帧率监测（{closed} 个进程）" if closed else "帧率监测未在运行"
+        self.parent.after(0, lambda m=message: self.status_callback(m))
+        self.parent.after(0, self._schedule_refresh_now)
+
+    def _request_elevated_close(self, failures: Dict[int, str], restart: bool) -> None:
+        pid_args = " ".join(f"/PID {pid}" for pid in failures)
+        try:
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                "taskkill.exe",
+                f"/T /F {pid_args}",
+                None,
+                0,
+            )
+            if result <= 32:
+                raise OSError(f"ShellExecuteW failed: {result}")
+            self.status_callback("已请求管理员权限关闭帧率监测")
+            if restart:
+                self.parent.after(1200, self.start_overlay)
+        except Exception as exc:
+            self.status_var.set("关闭失败")
+            messagebox.showerror(
+                "帧率监测关闭失败",
+                "无法关闭以管理员权限运行的帧率监测：\n"
+                + "\n".join([f"{pid}：{error}" for pid, error in failures.items()] + [str(exc)]),
+            )
+
+    def open_config_folder(self) -> None:
+        config_dir = FPS_OVERLAY_CONFIG_DIR
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(config_dir))
+            self.status_callback(f"已打开帧率监测配置目录：{config_dir}")
+        except Exception as exc:
+            messagebox.showerror("打开失败", f"无法打开配置目录：{exc}")
+
+    def _schedule_refresh_now(self) -> None:
+        if self.refresh_job:
+            try:
+                self.parent.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+            self.refresh_job = None
+        self._schedule_refresh()
+
+    def stop(self) -> None:
+        if self.refresh_job:
+            try:
+                self.parent.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+            self.refresh_job = None
+
+
 class StartupTab:
     def __init__(self, parent: tk.Widget, config: Dict, save_callback: Callable[[], None], status_callback: Callable[[str], None]):
         self.parent = parent
@@ -2604,6 +3217,7 @@ class UtilityToolbox:
         audio_frame = ttk.Frame(notebook)
         live_frame = ttk.Frame(notebook)
         system_frame = ttk.Frame(notebook)
+        fps_overlay_frame = ttk.Frame(notebook)
         startup_frame = ttk.Frame(notebook)
         launcher_frame = ttk.Frame(notebook)
         media_frame = ttk.Frame(notebook)
@@ -2616,6 +3230,7 @@ class UtilityToolbox:
         notebook.add(audio_frame, text="音频输出")
         notebook.add(live_frame, text="直播快捷")
         notebook.add(system_frame, text="系统工具")
+        notebook.add(fps_overlay_frame, text="帧率监测")
         notebook.add(startup_frame, text="自启动")
         notebook.add(launcher_frame, text="应用启动器")
         notebook.add(media_frame, text="照片视频管家")
@@ -2631,6 +3246,7 @@ class UtilityToolbox:
         self.audio = AudioSwitchTab(audio_frame, self.set_status)
         self.live_shortcuts = LiveShortcutTab(live_frame, self.set_status)
         self.system_tools = SystemToolsTab(system_frame, self.set_status)
+        self.fps_overlay = FpsOverlayTab(fps_overlay_frame, self.set_status)
         self.startup = StartupTab(startup_frame, self.config, self.save_config, self.set_status)
         self.launcher = LauncherTab(launcher_frame, self.set_status)
         self.media = MediaOrganizerTab(media_frame, self.set_status)
@@ -2787,6 +3403,7 @@ class UtilityToolbox:
             close_mic_toggle_processes()
             if self.window_refresh_job:
                 self.root.after_cancel(self.window_refresh_job)
+            self.fps_overlay.stop()
             self.backup.stop()
             self.drop_close.stop()
             self.topmost.stop()
