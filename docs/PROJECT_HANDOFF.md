@@ -4,7 +4,7 @@
 
 ## 1. 项目一句话概览
 
-`Windows 实用工具箱` 是一个面向 Windows 的本地桌面工具集合，主程序使用 `Tkinter` 编写，通过 `PyInstaller` 打包成单文件可执行程序。它把多个日常 Windows 小工具整合在一个窗口里，包括批量重命名、窗口置顶、存档备份、视频字幕同步、音频输出切换、直播快捷入口、系统工具、开机自启动、拖拽关闭应用、照片视频整理，以及一个独立的麦克风状态悬浮窗助手。
+`Windows 实用工具箱` 是一个面向 Windows 的本地桌面工具集合，主程序使用 `Tkinter` 编写，通过 `PyInstaller` 打包成单文件可执行程序。它把多个日常 Windows 小工具整合在一个窗口里，包括批量重命名、窗口置顶、存档备份、视频字幕同步、音频输出切换、直播快捷入口、系统工具、游戏帧率/硬件监测、开机自启动、拖拽关闭应用、照片视频整理，以及一个独立的麦克风状态悬浮窗助手。
 
 当前本机工作目录：
 
@@ -62,6 +62,10 @@ UtilityToolbox.spec
 ├─ mic_toggle/
 │  ├─ 一键麦克风开关.py              # 独立麦克风悬浮窗源码
 │  └─ 一键麦克风开关.spec            # 麦克风悬浮窗打包配置
+├─ fps_overlay/
+│  ├─ TinyFpsOverlay.exe             # 帧率监测单文件程序，打进主工具箱
+│  └─ tools/
+│     └─ PresentMon-2.5.1-x64.exe    # FPS 采集组件，打进主工具箱
 ├─ test_autostart.py               # 开机自启动路径修复测试
 ├─ test_launcher_close.py          # 拖拽关闭/进程匹配测试
 ├─ build/                          # PyInstaller 构建缓存，忽略
@@ -153,7 +157,8 @@ mic_tool_workspace\dist\Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe
 | `BackupMonitorTab` | `utility_toolbox.py` | 存档/文件夹备份监控。 |
 | `AudioSwitchTab` | `utility_toolbox.py` | 默认音频输出设备切换，使用 Windows Core Audio COM 接口。 |
 | `LiveShortcutTab` | `utility_toolbox.py` | 直播快捷入口，自动打开配置项。 |
-| `SystemToolsTab` | `utility_toolbox.py` | 系统工具：管理员 PowerShell、启动/关闭麦克风悬浮窗。 |
+| `SystemToolsTab` | `utility_toolbox.py` | 系统工具：管理员 PowerShell 7（`pwsh.exe`）、启动/关闭麦克风悬浮窗。 |
+| `FpsOverlayTab` | `utility_toolbox.py` | 部署、启动、重启、关闭 TinyFpsOverlay，显示状态并集中管理原托盘设置。 |
 | `StartupTab` | `utility_toolbox.py` | 开机启动配置，写入 Windows Run 注册表项。 |
 | `LauncherTab` | `utility_toolbox.py` | 应用启动器，支持拖拽启动并按路径关闭进程。 |
 | `MediaOrganizerTab` | `utility_toolbox.py` | 照片视频管家嵌入页，调用 `media_organizer` 扫描/整理逻辑。 |
@@ -170,9 +175,10 @@ mic_tool_workspace\dist\Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe
 5. 音频输出
 6. 直播快捷
 7. 系统工具
-8. 自启动
-9. 应用启动器
-10. 照片视频管家
+8. 帧率监测
+9. 自启动
+10. 应用启动器
+11. 照片视频管家
 
 对应代码在 `UtilityToolbox.__init__()` 附近。
 
@@ -335,7 +341,41 @@ subtitle_sync_embedded.py
 - 这是嵌入式工具，不是 `media_organizer` 的一部分。
 - 修改 UI 时注意 Tkinter 线程安全，后台任务更新界面应通过 `after()` 或封装的 safe UI 方法。
 
-### 5.7 照片视频管家
+### 5.7 帧率监测
+
+入口：主工具箱的“帧率监测”页，控制类为 `FpsOverlayTab`。
+
+运行组件：
+
+```text
+fps_overlay\TinyFpsOverlay.exe
+fps_overlay\tools\PresentMon-2.5.1-x64.exe
+```
+
+`UtilityToolbox.spec` 会把两个文件打进单文件工具箱。首次启动帧率监测时，
+`install_fps_overlay_runtime()` 会校验 SHA-256，并把组件部署到稳定目录：
+
+```text
+%LOCALAPPDATA%\UtilityToolbox\fps_overlay
+```
+
+不能直接长期从 PyInstaller 的 `_MEIPASS` 临时目录运行，因为 TinyFpsOverlay 自己支持开机
+自启动，注册表必须指向不会在工具箱退出后被删除的稳定路径。工具箱关闭或隐藏不会自动结束
+监测；用户可在此页点“关闭”结束它。
+
+组件依赖目标系统已安装 `.NET 8 Desktop Runtime`。帧率由外部 PresentMon 采集，关闭时使用
+`taskkill /T /F`，会同时清理其子进程。
+
+工具箱用 `--toolbox-managed` 参数启动 TinyFpsOverlay。在此模式下不显示独立托盘图标，
+并跳过 TinyFpsOverlay 自己的启动项修复。原托盘中的热键、开机自启动、字体颜色、字体
+大小、字体粗细和透明度均已移动到 `FpsOverlayTab`。工具箱直接读写
+`%APPDATA%\TinyFpsOverlay\config.json`，保存后重启悬浮条应用设置；开机启动命令固定为：
+
+```text
+"%LOCALAPPDATA%\UtilityToolbox\fps_overlay\TinyFpsOverlay.exe" --toolbox-managed
+```
+
+### 5.8 照片视频管家
 
 主工具箱入口类：`MediaOrganizerTab`
 
@@ -384,6 +424,7 @@ flowchart TD
 - `PyQt5`：`media_organizer/app.py` 独立 PyQt 窗口使用；主工具箱内嵌页主要走 Tkinter。
 - `pytest`：运行测试。
 - `PyInstaller`：打包。
+- `.NET 8 Desktop Runtime`：运行内置 TinyFpsOverlay。
 
 `UtilityToolbox.spec` 里已经显式包含部分 hidden imports：
 
@@ -506,12 +547,13 @@ reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v UtilityToolbox
 
 ## 9. 当前已知状态
 
-截至 2026-07-05：
+截至 2026-07-27：
 
 - 主项目位置：`C:\Users\User\Desktop\Python\工具箱`。
 - GitHub remote：`https://github.com/1972863663/utility-toolbox.git`。
 - 最新已知提交包含“关闭麦克风悬浮窗”按钮：`9dd2134 Add mic overlay close button`。
 - `README.md` 是简要说明；本文件是详细交接文档。
+- 已加入“帧率监测”页，TinyFpsOverlay 和 PresentMon 会随主工具箱打包并部署到稳定目录。
 - 旧路径 `C:\Users\User\Documents\工具箱` 可能曾被 Codex/Node REPL 占用导致空目录暂时删不掉，不代表项目还在那里。
 
 ## 10. 接手者最快上手路线
