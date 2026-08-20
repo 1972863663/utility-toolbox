@@ -9,8 +9,6 @@ a = Analysis(
     binaries=[],
     datas=[
         ('icons\\utility_toolbox.ico', 'icons'),
-        ('fps_overlay\\TinyFpsOverlay.exe', 'fps_overlay'),
-        ('fps_overlay\\tools\\PresentMon-2.5.1-x64.exe', 'fps_overlay\\tools'),
         *collect_data_files('tkinterdnd2'),
     ],
     hiddenimports=[

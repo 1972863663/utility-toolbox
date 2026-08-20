@@ -9,7 +9,6 @@ A local Windows Tkinter utility toolbox packaged with PyInstaller.
 - `utility_toolbox.py` - main application
 - `subtitle_sync_embedded.py` - embedded subtitle sync tool
 - `media_organizer/` - media organizer module
-- `fps_overlay/` - bundled TinyFpsOverlay runtime and PresentMon collector
 - `UtilityToolbox.spec` - PyInstaller build configuration
 - `icons/utility_toolbox.ico` - application icon
 - `test_launcher_close.py` - drag-to-close/process matching tests
@@ -23,16 +22,8 @@ pyinstaller UtilityToolbox.spec --noconfirm
 
 The packaged executable is generated at `dist/UtilityToolbox.exe`.
 
-## FPS overlay
-
-The `帧率监测` tab deploys the bundled `TinyFpsOverlay.exe` and PresentMon collector
-to `%LOCALAPPDATA%\UtilityToolbox\fps_overlay`, then provides start, restart, stop,
-status, hotkey, autostart, text color/size/weight, opacity, and config-folder
-controls. The embedded overlay is launched in toolbox-managed mode, so it does not
-show a separate TinyFpsOverlay tray icon. The stable deployment path keeps its
-autostart entry valid even though the toolbox itself is packaged as one file.
-
-The target system needs the .NET 8 Desktop Runtime.
+Closing the main window hides the toolbox to the Windows notification area instead of exiting.
+If Windows Explorer or the taskbar restarts, the toolbox automatically restores its tray icon.
 
 ## Microphone overlay helper
 

@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import utility_toolbox
 
@@ -160,6 +161,27 @@ class LauncherCloseTests(unittest.TestCase):
             utility_toolbox.sys.executable = original_executable
 
         self.assertEqual(matches, [(202, processes[1][1])])
+
+
+class TrayIconTests(unittest.TestCase):
+    def test_taskbar_restart_readds_tray_icon(self):
+        tray = utility_toolbox.TrayIcon.__new__(utility_toolbox.TrayIcon)
+        tray.hwnd = 123
+        tray.icon_handle = 456
+
+        with mock.patch.object(utility_toolbox, "log_line") as log, mock.patch.object(
+            utility_toolbox.win32gui, "Shell_NotifyIcon"
+        ) as notify:
+            result = tray._on_taskbar_created(123, tray.TASKBAR_CREATED, 0, 0)
+
+        self.assertTrue(result)
+        notify.assert_called_once()
+        command, notify_data = notify.call_args.args
+        self.assertEqual(command, utility_toolbox.win32gui.NIM_ADD)
+        self.assertEqual(notify_data[0], 123)
+        self.assertEqual(notify_data[3], tray.WM_TRAY)
+        self.assertEqual(notify_data[4], 456)
+        log.assert_called_once_with("检测到 Windows 任务栏重启，已恢复托盘图标")
 
 
 if __name__ == "__main__":
