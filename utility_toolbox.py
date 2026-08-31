@@ -386,6 +386,47 @@ MIC_TOGGLE_PROCESS_NAMES = {
     "一键麦克风开关.exe",
     "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
 }
+MIC_TOGGLE_CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "MicToggleHotkey" / "config.json"
+MIC_OVERLAY_DEFAULT_SCALE = 0.75
+MIC_OVERLAY_MIN_SCALE = 0.60
+MIC_OVERLAY_MAX_SCALE = 1.20
+
+
+def normalize_mic_overlay_scale(value: object) -> float:
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        scale = MIC_OVERLAY_DEFAULT_SCALE
+    return max(MIC_OVERLAY_MIN_SCALE, min(MIC_OVERLAY_MAX_SCALE, scale))
+
+
+def read_mic_overlay_scale() -> float:
+    try:
+        saved = json.loads(MIC_TOGGLE_CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            return normalize_mic_overlay_scale(saved.get("overlay_scale"))
+    except (OSError, ValueError, TypeError):
+        pass
+    return MIC_OVERLAY_DEFAULT_SCALE
+
+
+def save_mic_overlay_scale(scale: float) -> float:
+    normalized = normalize_mic_overlay_scale(scale)
+    saved: Dict = {}
+    if MIC_TOGGLE_CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(MIC_TOGGLE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"麦克风配置文件无法读取：{exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("麦克风配置文件格式无效")
+        saved.update(loaded)
+    saved["overlay_scale"] = normalized
+    MIC_TOGGLE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = MIC_TOGGLE_CONFIG_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary_path, MIC_TOGGLE_CONFIG_PATH)
+    return normalized
 
 
 def running_mic_toggle_processes() -> List[Tuple[int, str, str]]:
@@ -1700,6 +1741,33 @@ class SystemToolsTab:
             command=self.close_mic_toggle,
         ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
 
+        size_box = ttk.LabelFrame(frame, text="麦克风悬浮窗大小", padding=scaled(12, self.scale))
+        size_box.pack(anchor=tk.W, fill=tk.X, pady=(scaled(14, self.scale), 0))
+        size_row = ttk.Frame(size_box)
+        size_row.pack(anchor=tk.W)
+        self.mic_overlay_scale_var = tk.StringVar(value=f"{round(read_mic_overlay_scale() * 100)}")
+        ttk.Label(size_row, text="缩放比例").pack(side=tk.LEFT)
+        self.mic_overlay_scale_input = ttk.Spinbox(
+            size_row,
+            from_=round(MIC_OVERLAY_MIN_SCALE * 100),
+            to=round(MIC_OVERLAY_MAX_SCALE * 100),
+            increment=5,
+            width=6,
+            textvariable=self.mic_overlay_scale_var,
+            justify=tk.CENTER,
+        )
+        self.mic_overlay_scale_input.pack(side=tk.LEFT, padx=(scaled(10, self.scale), scaled(4, self.scale)))
+        ttk.Label(size_row, text="%").pack(side=tk.LEFT)
+        ttk.Button(size_row, text="应用大小", command=self.apply_mic_overlay_scale).pack(
+            side=tk.LEFT,
+            padx=(scaled(12, self.scale), 0),
+        )
+        ttk.Label(
+            size_box,
+            text="可输入 60–120；图标、字体和间距会一起等比例变化。",
+            foreground=THEME["muted"],
+        ).pack(anchor=tk.W, pady=(scaled(8, self.scale), 0))
+
     def open_admin_powershell7(self) -> None:
         try:
             executable = powershell7_executable()
@@ -1718,6 +1786,23 @@ class SystemToolsTab:
             self.status_callback("已请求管理员权限启动 PowerShell 7")
         except Exception as exc:
             messagebox.showerror("启动失败", f"无法以管理员身份启动 PowerShell 7：{exc}")
+
+    def apply_mic_overlay_scale(self) -> None:
+        try:
+            percent = float(self.mic_overlay_scale_var.get().strip())
+            minimum = MIC_OVERLAY_MIN_SCALE * 100
+            maximum = MIC_OVERLAY_MAX_SCALE * 100
+            if not minimum <= percent <= maximum:
+                raise ValueError(f"请输入 {minimum:.0f}–{maximum:.0f} 之间的数值")
+            saved_scale = save_mic_overlay_scale(percent / 100.0)
+            saved_percent = round(saved_scale * 100)
+            self.mic_overlay_scale_var.set(str(saved_percent))
+            if self._running_mic_processes():
+                self.status_callback(f"麦克风悬浮窗已调整为 {saved_percent}%（约 1 秒内生效）")
+            else:
+                self.status_callback(f"麦克风悬浮窗大小已保存为 {saved_percent}%（启动后生效）")
+        except Exception as exc:
+            messagebox.showerror("设置失败", f"无法保存麦克风悬浮窗大小：{exc}")
 
     def open_mic_toggle(self) -> None:
         if self._running_mic_processes():

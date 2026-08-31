@@ -13,6 +13,7 @@ A local Windows Tkinter utility toolbox packaged with PyInstaller.
 - `icons/utility_toolbox.ico` - application icon
 - `test_launcher_close.py` - drag-to-close/process matching tests
 - `test_autostart.py` - autostart repair tests
+- `test_system_tools.py` - PowerShell and microphone overlay configuration tests
 
 ## Build
 
@@ -31,6 +32,14 @@ If Windows Explorer or the taskbar restarts, the toolbox automatically restores 
 - `mic_toggle/一键麦克风开关.spec` - PyInstaller build configuration for the helper
 
 The helper is intentionally mouse-click-through so it does not block game clicks, cannot be dragged accidentally, and does not respond to mouse clicks by default.
+
+The mute hotkey resolves the current Windows primary default capture endpoint on every operation instead of using the separate default communications device. The overlay shows that device's name and reloads its saved size while running. In the toolbox, open `系统工具 → 麦克风悬浮窗大小` to choose a proportional scale from 60% to 120%; the default is 75%.
+
+Build the helper into the local workspace with:
+
+```powershell
+python -m PyInstaller mic_toggle\一键麦克风开关.spec --noconfirm --clean --distpath mic_tool_workspace\dist --workpath mic_tool_workspace\build\mic-toggle
+```
 
 ## Local consolidated layout
 

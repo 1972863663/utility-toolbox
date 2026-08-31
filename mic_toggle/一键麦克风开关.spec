@@ -1,8 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+source_path = Path(SPECPATH) / '一键麦克风开关.py'
 
 a = Analysis(
-    ['C:\\Users\\User\\Documents\\工具箱\\mic_tool_workspace\\一键麦克风开关.py'],
+    [str(source_path)],
     pathex=[],
     binaries=[],
     datas=[],

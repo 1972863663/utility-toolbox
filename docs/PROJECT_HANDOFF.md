@@ -118,6 +118,14 @@ mic_toggle\一键麦克风开关.py
 mic_toggle\一键麦克风开关.spec
 ```
 
+从项目根目录执行：
+
+```powershell
+python -m PyInstaller mic_toggle\一键麦克风开关.spec --noconfirm --clean --distpath mic_tool_workspace\dist --workpath mic_tool_workspace\build\mic-toggle
+```
+
+spec 使用自身目录下的相对源码路径，不依赖旧的 `Documents\工具箱` 绝对路径。
+
 常见输出位置是：
 
 ```text
@@ -301,6 +309,14 @@ mic_toggle\一键麦克风开关.py
 - “启动麦克风悬浮窗”
 - “关闭麦克风悬浮窗”
 
+当前麦克风与显示行为：
+
+- 每次读取或切换都会重新解析 Windows 当前主默认输入设备（Core Audio `eConsole`），不会再固定控制单独的“默认通信设备”。
+- 悬浮窗显示“麦克风已开启/已静音”和当前默认设备名；切换默认输入设备后无需重启助手。
+- 深色状态卡保持置顶和鼠标穿透；开启态为绿色，静音态为玫红。
+- “系统工具 → 麦克风悬浮窗大小”允许输入 `60%–120%`，默认 `75%`；图标、字体、间距、边框和右上角边距等比例变化。
+- 配置保存在 `%APPDATA%\MicToggleHotkey\config.json` 的 `overlay_scale` 字段；运行中的助手每秒重新读取，约 1 秒内生效，并保留原有热键字段。
+
 历史问题：
 
 - 麦克风悬浮窗是鼠标穿透窗口，设计上不挡游戏/桌面点击。
@@ -436,7 +452,7 @@ python -m py_compile mic_toggle\一键麦克风开关.py
 ### 7.3 运行测试
 
 ```powershell
-python -m pytest test_launcher_close.py test_autostart.py
+python -m pytest test_launcher_close.py test_autostart.py test_system_tools.py
 ```
 
 ### 7.4 打包
@@ -510,6 +526,8 @@ reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v UtilityToolbox
 - 如果用户说“悬浮窗关不掉”，优先处理主工具箱里的“关闭麦克风悬浮窗”按钮，而不是要求用户去点悬浮窗。
 - 如果存在多个 `一键麦克风开关.exe`，关闭按钮应全部处理。
 - 管理员权限不一致时，要么以管理员运行工具箱，要么保留 UAC fallback。
+- 麦克风端点必须使用主默认输入角色并在每次操作时重新解析；不要改回 `eCommunications`，否则可能静音另一支通信设备。
+- 尺寸必须通过统一比例更新图标、字体和间距；不要只缩字体，也不要为了可调尺寸取消鼠标穿透。
 
 ### 8.5 修改 UI 时的坑
 
@@ -520,14 +538,16 @@ reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v UtilityToolbox
 
 ## 9. 当前已知状态
 
-截至 2026-08-20：
+截至 2026-09-01：
 
 - 主项目位置：`C:\Users\User\Desktop\Python\工具箱`。
 - GitHub remote：`https://github.com/1972863663/utility-toolbox.git`。
 - GitHub 默认分支修复前基线为 `c7dc543 Integrate FPS overlay into utility toolbox (#1)`；本地已移除帧率监测集成及其可再部署资源。
 - `README.md` 是简要说明；本文件是详细交接文档。
-- 当前源码测试为 `18 passed`，PyInstaller 6.20.0 构建通过，桌面 `工具箱.exe` 已更新。
+- 当前源码测试为 `20 passed`，主工具箱和麦克风助手均已通过 PyInstaller 6.20.0 / Python 3.12.10 构建并部署。
 - 已实测：通知区图标被移除后发送 `TaskbarCreated` 可恢复；关闭主窗口后进程和托盘仍在；托盘点击可重新打开主窗口。
+- 已实测：当前主默认输入 `Maono AI Microphone` 可由 `MouseX2` 静音并恢复，单独的通信默认设备 `PD200X Podcast Microphone` 状态不变。
+- 已实测：悬浮窗运行中可在 `60%`（约 `186×56`）、`75%`（约 `223×65`）和 `100%`（约 `292×79`）之间即时等比变化，三种尺寸的 Win32 命中测试均为 `HTTRANSPARENT (-1)`。
 - 旧路径 `C:\Users\User\Documents\工具箱` 可能曾被 Codex/Node REPL 占用导致空目录暂时删不掉，不代表项目还在那里。
 
 ## 10. 接手者最快上手路线

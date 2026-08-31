@@ -3,10 +3,12 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import sys
 import threading
 import time
 import uuid
+import winreg
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox
@@ -16,7 +18,14 @@ import tkinter as tk
 APP_NAME = "一键麦克风开关"
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "MicToggleHotkey"
 CONFIG_PATH = CONFIG_DIR / "config.json"
-DEFAULT_CONFIG = {"hotkey": "Ctrl+Alt+M", "hotkey_codes": [0x11, 0x12, 0x4D]}
+DEFAULT_OVERLAY_SCALE = 0.75
+MIN_OVERLAY_SCALE = 0.60
+MAX_OVERLAY_SCALE = 1.20
+DEFAULT_CONFIG = {
+    "hotkey": "Ctrl+Alt+M",
+    "hotkey_codes": [0x11, 0x12, 0x4D],
+    "overlay_scale": DEFAULT_OVERLAY_SCALE,
+}
 MUTEX_NAME = "Global\\MicToggleHotkeySingleInstance"
 
 GWLP_WNDPROC = -4
@@ -32,7 +41,23 @@ _CLICK_THROUGH_WNDPROCS: dict[int, tuple[object, int]] = {}
 
 CLSCTX_ALL = 23
 E_CAPTURE = 1
+ROLE_CONSOLE = 0
 ROLE_COMMUNICATIONS = 2
+DEFAULT_CAPTURE_ROLE = ROLE_CONSOLE
+CAPTURE_DEVICE_REGISTRY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+ENDPOINT_NAME_PROPERTY = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+FALLBACK_DEVICE_NAME = "当前默认麦克风"
+
+OVERLAY_PANEL = "#101827"
+OVERLAY_BORDER = "#334155"
+OVERLAY_TEXT = "#F8FAFC"
+OVERLAY_MUTED_TEXT = "#94A3B8"
+OVERLAY_MUTED_ACCENT = "#FB7185"
+OVERLAY_MUTED_ICON_BG = "#3B1722"
+OVERLAY_ACTIVE_ACCENT = "#34D399"
+OVERLAY_ACTIVE_ICON_BG = "#0C332A"
+OVERLAY_ERROR_ACCENT = "#FBBF24"
+OVERLAY_ERROR_ICON_BG = "#3A2A0A"
 
 KEY_NAMES: dict[int, str] = {
     0x01: "MouseLeft",
@@ -128,6 +153,8 @@ ole32.CoCreateInstance.argtypes = [
     ctypes.POINTER(ctypes.c_void_p),
 ]
 ole32.CoCreateInstance.restype = ctypes.c_long
+ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+ole32.CoTaskMemFree.restype = None
 
 
 def is_admin() -> bool:
@@ -178,12 +205,23 @@ def load_config() -> dict:
         codes = parse_hotkey_text(str(config.get("hotkey") or DEFAULT_CONFIG["hotkey"]))
     config["hotkey_codes"] = codes or list(DEFAULT_CONFIG["hotkey_codes"])
     config["hotkey"] = format_hotkey(config["hotkey_codes"])
+    config["overlay_scale"] = normalize_overlay_scale(config.get("overlay_scale"))
     return config
 
 
 def save_config(config: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path = CONFIG_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary_path, CONFIG_PATH)
+
+
+def normalize_overlay_scale(value: object) -> float:
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        scale = DEFAULT_OVERLAY_SCALE
+    return max(MIN_OVERLAY_SCALE, min(MAX_OVERLAY_SCALE, scale))
 
 
 def key_down(vk: int) -> bool:
@@ -418,13 +456,41 @@ def create_com_object(clsid: str, iid: str) -> ctypes.c_void_p:
     return result
 
 
-def get_default_capture_endpoint_volume() -> ctypes.c_void_p:
+def endpoint_registry_id(endpoint_id: str) -> str:
+    match = re.search(r"(\{[0-9A-Fa-f-]{36}\})$", endpoint_id)
+    return match.group(1) if match else endpoint_id
+
+
+def capture_device_name(endpoint_id: str) -> str:
+    key_path = f"{CAPTURE_DEVICE_REGISTRY}\\{endpoint_registry_id(endpoint_id)}\\Properties"
+    access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, access) as key:
+            value, _value_type = winreg.QueryValueEx(key, ENDPOINT_NAME_PROPERTY)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except OSError:
+        pass
+    return FALLBACK_DEVICE_NAME
+
+
+def get_default_capture_endpoint_volume(role: int = DEFAULT_CAPTURE_ROLE) -> tuple[ctypes.c_void_p, str]:
     enumerator = create_com_object("BCDE0395-E52F-467C-8E3D-C4579291692E", "A95664D2-9614-4F35-A746-DE8DB63617E6")
     device = ctypes.c_void_p()
     endpoint = ctypes.c_void_p()
+    endpoint_id = ""
     try:
         get_default = com_method(enumerator, 4, ctypes.c_long, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
-        check_hr(get_default(enumerator, E_CAPTURE, ROLE_COMMUNICATIONS, ctypes.byref(device)), "GetDefaultAudioEndpoint")
+        check_hr(get_default(enumerator, E_CAPTURE, role, ctypes.byref(device)), "GetDefaultAudioEndpoint")
+
+        raw_id = ctypes.c_wchar_p()
+        try:
+            get_id = com_method(device, 5, ctypes.c_long, ctypes.POINTER(ctypes.c_wchar_p))
+            check_hr(get_id(device, ctypes.byref(raw_id)), "IMMDevice.GetId")
+            endpoint_id = raw_id.value or ""
+        finally:
+            if raw_id:
+                ole32.CoTaskMemFree(raw_id)
 
         activate = com_method(
             device,
@@ -437,49 +503,76 @@ def get_default_capture_endpoint_volume() -> ctypes.c_void_p:
         )
         endpoint_iid = GUID.from_string("5CDF2C82-841E-4546-9722-0CF74078229A")
         check_hr(activate(device, ctypes.byref(endpoint_iid), CLSCTX_ALL, None, ctypes.byref(endpoint)), "IMMDevice.Activate")
-        return endpoint
+        return endpoint, endpoint_id
     finally:
         release(device)
         release(enumerator)
 
 
-def get_mic_muted() -> bool:
+def endpoint_is_muted(endpoint: ctypes.c_void_p) -> bool:
+    get_mute = com_method(endpoint, 15, ctypes.c_long, ctypes.POINTER(wintypes.BOOL))
+    muted = wintypes.BOOL()
+    check_hr(get_mute(endpoint, ctypes.byref(muted)), "IAudioEndpointVolume.GetMute")
+    return bool(muted.value)
+
+
+def set_endpoint_muted(endpoint: ctypes.c_void_p, muted: bool) -> None:
+    set_mute = com_method(endpoint, 14, ctypes.c_long, wintypes.BOOL, ctypes.POINTER(GUID))
+    event_context = GUID.from_string("F6C9199E-2178-4D63-99AB-5F0600D9219D")
+    check_hr(set_mute(endpoint, wintypes.BOOL(1 if muted else 0), ctypes.byref(event_context)), "IAudioEndpointVolume.SetMute")
+
+
+def get_mic_status(role: int = DEFAULT_CAPTURE_ROLE) -> tuple[bool, str, str]:
     ole32.CoInitialize(None)
     endpoint = ctypes.c_void_p()
     try:
-        endpoint = get_default_capture_endpoint_volume()
-        get_mute = com_method(endpoint, 15, ctypes.c_long, ctypes.POINTER(wintypes.BOOL))
-        muted = wintypes.BOOL()
-        check_hr(get_mute(endpoint, ctypes.byref(muted)), "IAudioEndpointVolume.GetMute")
-        return bool(muted.value)
+        endpoint, endpoint_id = get_default_capture_endpoint_volume(role)
+        return endpoint_is_muted(endpoint), capture_device_name(endpoint_id), endpoint_id
     finally:
         release(endpoint)
         ole32.CoUninitialize()
 
 
-def set_mic_muted(muted: bool) -> None:
+def get_mic_muted(role: int = DEFAULT_CAPTURE_ROLE) -> bool:
+    return get_mic_status(role)[0]
+
+
+def set_mic_muted(muted: bool, role: int = DEFAULT_CAPTURE_ROLE) -> None:
     ole32.CoInitialize(None)
     endpoint = ctypes.c_void_p()
     try:
-        endpoint = get_default_capture_endpoint_volume()
-        set_mute = com_method(endpoint, 14, ctypes.c_long, wintypes.BOOL, ctypes.POINTER(GUID))
-        event_context = GUID.from_string("F6C9199E-2178-4D63-99AB-5F0600D9219D")
-        check_hr(set_mute(endpoint, wintypes.BOOL(1 if muted else 0), ctypes.byref(event_context)), "IAudioEndpointVolume.SetMute")
+        endpoint, _endpoint_id = get_default_capture_endpoint_volume(role)
+        set_endpoint_muted(endpoint, muted)
     finally:
         release(endpoint)
         ole32.CoUninitialize()
 
 
-def toggle_mic() -> bool:
-    muted = not get_mic_muted()
-    set_mic_muted(muted)
-    return muted
+def toggle_mic_status(role: int = DEFAULT_CAPTURE_ROLE) -> tuple[bool, str, str]:
+    ole32.CoInitialize(None)
+    endpoint = ctypes.c_void_p()
+    try:
+        endpoint, endpoint_id = get_default_capture_endpoint_volume(role)
+        muted = not endpoint_is_muted(endpoint)
+        set_endpoint_muted(endpoint, muted)
+        return muted, capture_device_name(endpoint_id), endpoint_id
+    finally:
+        release(endpoint)
+        ole32.CoUninitialize()
+
+
+def toggle_mic(role: int = DEFAULT_CAPTURE_ROLE) -> bool:
+    return toggle_mic_status(role)[0]
 
 
 class StatusOverlay:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, scale: float = DEFAULT_OVERLAY_SCALE):
         self.root = root
-        self.muted: bool | None = None
+        self.state_signature: tuple[bool, str] | None = None
+        self.scale = normalize_overlay_scale(scale)
+        self.current_accent = OVERLAY_ERROR_ACCENT
+        self.current_icon_bg = OVERLAY_ERROR_ICON_BG
+        self.current_muted = False
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -489,25 +582,101 @@ class StatusOverlay:
         root.attributes("-alpha", 1.0)
         root.resizable(False, False)
 
-        self.label = tk.Label(
+        root.configure(bg=OVERLAY_BORDER)
+        self.card = tk.Frame(
             root,
-            text="检测中",
-            fg="#ffffff",
-            font=("Microsoft YaHei UI", 16, "bold"),
-            padx=18,
-            pady=10,
+            bg=OVERLAY_PANEL,
+            highlightbackground=OVERLAY_BORDER,
+            highlightthickness=0,
+            bd=0,
         )
-        self.label.pack()
-        self.place_top_right()
+        self.card.pack()
+
+        self.accent = tk.Frame(self.card, bg=OVERLAY_ERROR_ACCENT)
+        self.accent.pack(side=tk.LEFT, fill=tk.Y)
+        self.accent.pack_propagate(False)
+
+        self.icon = tk.Canvas(
+            self.card,
+            bg=OVERLAY_PANEL,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.icon.pack(side=tk.LEFT)
+
+        self.text_area = tk.Frame(self.card, bg=OVERLAY_PANEL)
+        self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.status_label = tk.Label(
+            self.text_area,
+            text="正在检测麦克风",
+            bg=OVERLAY_PANEL,
+            fg=OVERLAY_TEXT,
+            anchor=tk.W,
+        )
+        self.status_label.pack(anchor=tk.W)
+        self.device_label = tk.Label(
+            self.text_area,
+            text="读取当前默认设备…",
+            bg=OVERLAY_PANEL,
+            fg=OVERLAY_MUTED_TEXT,
+            anchor=tk.W,
+        )
+        self.device_label.pack(anchor=tk.W)
+        self.set_scale(self.scale, force=True)
         self.enable_click_through()
         self.reinforce_click_through()
 
+    def scaled(self, value: float) -> int:
+        return max(1, round(value * self.scale))
+
+    def set_scale(self, scale: float, force: bool = False) -> None:
+        normalized = normalize_overlay_scale(scale)
+        if not force and abs(normalized - self.scale) < 0.001:
+            return
+        self.scale = normalized
+        self.card.configure(highlightthickness=max(1, self.scaled(1)))
+        self.accent.configure(width=self.scaled(4), height=self.scaled(68))
+        self.icon.configure(width=self.scaled(42), height=self.scaled(42))
+        self.icon.pack_configure(
+            padx=(self.scaled(12), self.scaled(10)),
+            pady=self.scaled(13),
+        )
+        self.text_area.pack_configure(
+            padx=(0, self.scaled(16)),
+            pady=(self.scaled(11), self.scaled(10)),
+        )
+        self.status_label.configure(
+            font=("Microsoft YaHei UI", max(7, self.scaled(13)), "bold"),
+        )
+        self.device_label.configure(
+            font=("Microsoft YaHei UI", max(6, self.scaled(9))),
+        )
+        self.device_label.pack_configure(pady=(self.scaled(3), 0))
+        self.draw_icon(self.current_accent, self.current_icon_bg, self.current_muted)
+        self.place_top_right()
+        self.reinforce_click_through()
+
+    def draw_icon(self, accent: str, icon_bg: str, muted: bool) -> None:
+        s = self.scaled
+        self.icon.delete("all")
+        self.icon.create_oval(s(1), s(1), s(41), s(41), fill=icon_bg, outline=icon_bg)
+        self.icon.create_line(s(21), s(10), s(21), s(23), fill=accent, width=s(6), capstyle=tk.ROUND)
+        self.icon.create_arc(s(12), s(14), s(30), s(31), start=180, extent=180, style=tk.ARC, outline=accent, width=s(2))
+        self.icon.create_line(s(21), s(30), s(21), s(34), fill=accent, width=s(2))
+        self.icon.create_line(s(16), s(34), s(26), s(34), fill=accent, width=s(2), capstyle=tk.ROUND)
+        if muted:
+            self.icon.create_line(s(10), s(32), s(32), s(10), fill=accent, width=s(3), capstyle=tk.ROUND)
+
     def place_top_right(self) -> None:
+        # Clear the previous explicit geometry before measuring so a newly
+        # selected device name can grow the card instead of being clipped.
+        self.root.geometry("")
         self.root.update_idletasks()
         width = self.root.winfo_width()
         height = self.root.winfo_height()
-        x = self.root.winfo_screenwidth() - width - 24
-        y = 24
+        margin = self.scaled(24)
+        x = self.root.winfo_screenwidth() - width - margin
+        y = margin
         self.root.geometry(f"{width}x{height}+{x}+{y}")
         self.enable_click_through()
 
@@ -522,21 +691,36 @@ class StatusOverlay:
         for delay_ms in (50, 150, 350, 750, 1500):
             self.root.after(delay_ms, self.enable_click_through)
 
-    def set_state(self, muted: bool) -> None:
-        if self.muted == muted:
+    def set_state(self, muted: bool, device_name: str = FALLBACK_DEVICE_NAME) -> None:
+        signature = (muted, device_name)
+        if self.state_signature == signature:
             return
-        self.muted = muted
-        text = "已闭麦" if muted else "已开麦"
-        bg = "#b91c1c" if muted else "#047857"
-        self.root.configure(bg=bg)
-        self.label.configure(text=text, bg=bg)
+        self.state_signature = signature
+        status_text = "麦克风已静音" if muted else "麦克风已开启"
+        accent = OVERLAY_MUTED_ACCENT if muted else OVERLAY_ACTIVE_ACCENT
+        icon_bg = OVERLAY_MUTED_ICON_BG if muted else OVERLAY_ACTIVE_ICON_BG
+        self.current_accent = accent
+        self.current_icon_bg = icon_bg
+        self.current_muted = muted
+        self.accent.configure(bg=accent)
+        self.status_label.configure(text=status_text)
+        self.device_label.configure(text=f"默认设备  ·  {device_name}")
+        self.draw_icon(accent, icon_bg, muted)
+        self.place_top_right()
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.enable_click_through()
 
     def set_error(self) -> None:
-        self.root.configure(bg="#374151")
-        self.label.configure(text="麦克风异常", bg="#374151")
+        self.state_signature = None
+        self.current_accent = OVERLAY_ERROR_ACCENT
+        self.current_icon_bg = OVERLAY_ERROR_ICON_BG
+        self.current_muted = False
+        self.accent.configure(bg=OVERLAY_ERROR_ACCENT)
+        self.status_label.configure(text="麦克风连接异常")
+        self.device_label.configure(text="请检查当前默认输入设备")
+        self.draw_icon(OVERLAY_ERROR_ACCENT, OVERLAY_ERROR_ICON_BG, muted=False)
+        self.place_top_right()
         self.enable_click_through()
 
 
@@ -544,7 +728,7 @@ class MicToggleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.config = load_config()
-        self.overlay = StatusOverlay(root)
+        self.overlay = StatusOverlay(root, self.config["overlay_scale"])
         self.busy = threading.Lock()
         self.hotkey_was_down = False
         self.recording = False
@@ -634,21 +818,26 @@ class MicToggleApp:
 
     def _toggle_worker(self) -> None:
         try:
-            muted = toggle_mic()
-            self.root.after(0, lambda: self.overlay.set_state(muted))
+            muted, device_name, _endpoint_id = toggle_mic_status()
+            self.root.after(0, lambda: self.overlay.set_state(muted, device_name))
         except Exception as exc:
             self.root.after(0, lambda: messagebox.showerror(APP_NAME, f"切换麦克风失败：{exc}"))
         finally:
             self.busy.release()
 
     def poll_state(self) -> None:
+        latest_config = load_config()
+        if latest_config != self.config:
+            self.config = latest_config
+            self.overlay.set_scale(self.config["overlay_scale"])
+            self.refresh_menu()
         threading.Thread(target=self._poll_worker, daemon=True).start()
         self.root.after(1000, self.poll_state)
 
     def _poll_worker(self) -> None:
         try:
-            muted = get_mic_muted()
-            self.root.after(0, lambda: self.overlay.set_state(muted))
+            muted, device_name, _endpoint_id = get_mic_status()
+            self.root.after(0, lambda: self.overlay.set_state(muted, device_name))
         except Exception:
             self.root.after(0, self.overlay.set_error)
 
