@@ -315,7 +315,8 @@ mic_toggle\一键麦克风开关.py
 - 悬浮窗显示“麦克风已开启/已静音”和当前默认设备名；切换默认输入设备后无需重启助手。
 - 深色状态卡保持置顶和鼠标穿透；开启态为绿色，静音态为玫红。
 - “系统工具 → 麦克风悬浮窗大小”允许输入 `60%–120%`，默认 `75%`；图标、字体、间距、边框和右上角边距等比例变化。
-- 配置保存在 `%APPDATA%\MicToggleHotkey\config.json` 的 `overlay_scale` 字段；运行中的助手每秒重新读取，约 1 秒内生效，并保留原有热键字段。
+- “系统工具 → 麦克风开启/静音快捷键”允许启用或关闭全局快捷键，也可以直接输入或录制键盘/鼠标组合；支持 `F1–F12`、`MouseX1`、`MouseX2` 等按键。
+- 配置保存在 `%APPDATA%\MicToggleHotkey\config.json` 的 `hotkey_enabled`、`hotkey`、`hotkey_codes` 和 `overlay_scale` 字段；运行中的助手每秒重新读取，约 1 秒内生效。
 
 历史问题：
 
@@ -544,9 +545,10 @@ reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v UtilityToolbox
 - GitHub remote：`https://github.com/1972863663/utility-toolbox.git`。
 - GitHub 默认分支修复前基线为 `c7dc543 Integrate FPS overlay into utility toolbox (#1)`；本地已移除帧率监测集成及其可再部署资源。
 - `README.md` 是简要说明；本文件是详细交接文档。
-- 当前源码测试为 `20 passed`，主工具箱和麦克风助手均已通过 PyInstaller 6.20.0 / Python 3.12.10 构建并部署。
+- 当前源码测试为 `25 passed`，主工具箱和麦克风助手均已通过 PyInstaller 6.20.0 / Python 3.12.10 构建并部署。
 - 已实测：通知区图标被移除后发送 `TaskbarCreated` 可恢复；关闭主窗口后进程和托盘仍在；托盘点击可重新打开主窗口。
 - 已实测：当前主默认输入 `Maono AI Microphone` 可由 `MouseX2` 静音并恢复，单独的通信默认设备 `PD200X Podcast Microphone` 状态不变。
+- 已实测：运行中可将 `MouseX2` 快捷键关闭，关闭后同一按键不再改变麦克风状态；重新启用后配置继续生效。
 - 已实测：悬浮窗运行中可在 `60%`（约 `186×56`）、`75%`（约 `223×65`）和 `100%`（约 `292×79`）之间即时等比变化，三种尺寸的 Win32 命中测试均为 `HTTRANSPARENT (-1)`。
 - 旧路径 `C:\Users\User\Documents\工具箱` 可能曾被 Codex/Node REPL 占用导致空目录暂时删不掉，不代表项目还在那里。
 

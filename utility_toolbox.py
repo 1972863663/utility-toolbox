@@ -390,6 +390,73 @@ MIC_TOGGLE_CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "Mi
 MIC_OVERLAY_DEFAULT_SCALE = 0.75
 MIC_OVERLAY_MIN_SCALE = 0.60
 MIC_OVERLAY_MAX_SCALE = 1.20
+MIC_HOTKEY_DEFAULT_ENABLED = True
+MIC_HOTKEY_DEFAULT_CODES = [0x11, 0x12, 0x4D]
+MIC_HOTKEY_KEY_NAMES: Dict[int, str] = {
+    0x01: "MouseLeft",
+    0x02: "MouseRight",
+    0x04: "MouseMiddle",
+    0x05: "MouseX1",
+    0x06: "MouseX2",
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x10: "Shift",
+    0x11: "Ctrl",
+    0x12: "Alt",
+    0x13: "Pause",
+    0x14: "CapsLock",
+    0x1B: "Esc",
+    0x20: "Space",
+    0x21: "PageUp",
+    0x22: "PageDown",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x2D: "Insert",
+    0x2E: "Delete",
+    0x5B: "Win",
+    0x5C: "Win",
+}
+for code in range(0x30, 0x3A):
+    MIC_HOTKEY_KEY_NAMES[code] = chr(code)
+for code in range(0x41, 0x5B):
+    MIC_HOTKEY_KEY_NAMES[code] = chr(code)
+for index in range(1, 13):
+    MIC_HOTKEY_KEY_NAMES[0x6F + index] = f"F{index}"
+MIC_HOTKEY_SCAN_ORDER = [
+    0x11,
+    0x12,
+    0x10,
+    0x5B,
+    0x5C,
+    *range(0x41, 0x5B),
+    *range(0x30, 0x3A),
+    *range(0x70, 0x7C),
+    0x01,
+    0x02,
+    0x04,
+    0x05,
+    0x06,
+    0x08,
+    0x09,
+    0x0D,
+    0x1B,
+    0x20,
+    0x21,
+    0x22,
+    0x23,
+    0x24,
+    0x25,
+    0x26,
+    0x27,
+    0x28,
+    0x2D,
+    0x2E,
+]
 
 
 def normalize_mic_overlay_scale(value: object) -> float:
@@ -427,6 +494,91 @@ def save_mic_overlay_scale(scale: float) -> float:
     temporary_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary_path, MIC_TOGGLE_CONFIG_PATH)
     return normalized
+
+
+def format_mic_hotkey(codes: Iterable[int]) -> str:
+    order = {code: index for index, code in enumerate(MIC_HOTKEY_SCAN_ORDER)}
+    unique_codes = dict.fromkeys(codes)
+    return "+".join(
+        MIC_HOTKEY_KEY_NAMES[code]
+        for code in sorted(unique_codes, key=lambda code: order.get(code, 999))
+        if code in MIC_HOTKEY_KEY_NAMES
+    )
+
+
+def parse_mic_hotkey(text: str) -> List[int]:
+    reverse = {name.lower(): code for code, name in MIC_HOTKEY_KEY_NAMES.items()}
+    reverse.update(
+        {
+            "control": 0x11,
+            "esc": 0x1B,
+            "escape": 0x1B,
+            "leftmouse": 0x01,
+            "mouseleft": 0x01,
+            "rightmouse": 0x02,
+            "mouseright": 0x02,
+            "middlemouse": 0x04,
+            "mousemiddle": 0x04,
+        }
+    )
+    parts = [part for part in text.replace(" ", "").split("+") if part]
+    if not parts:
+        raise ValueError("快捷键不能为空")
+    codes: List[int] = []
+    for part in parts:
+        code = reverse.get(part.lower())
+        if code is None:
+            raise ValueError(f"不支持的按键：{part}")
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
+def read_mic_hotkey_settings() -> Tuple[bool, str, List[int]]:
+    saved: Dict = {}
+    try:
+        loaded = json.loads(MIC_TOGGLE_CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            saved.update(loaded)
+    except (OSError, ValueError, TypeError):
+        pass
+    enabled = saved.get("hotkey_enabled", MIC_HOTKEY_DEFAULT_ENABLED)
+    if not isinstance(enabled, bool):
+        enabled = MIC_HOTKEY_DEFAULT_ENABLED
+    codes = saved.get("hotkey_codes")
+    if not isinstance(codes, list) or not codes or any(code not in MIC_HOTKEY_KEY_NAMES for code in codes):
+        try:
+            codes = parse_mic_hotkey(str(saved.get("hotkey") or "Ctrl+Alt+M"))
+        except ValueError:
+            codes = list(MIC_HOTKEY_DEFAULT_CODES)
+    canonical = format_mic_hotkey(codes)
+    return enabled, canonical, list(codes)
+
+
+def save_mic_hotkey_settings(enabled: bool, hotkey_text: str) -> Tuple[bool, str, List[int]]:
+    codes = parse_mic_hotkey(hotkey_text)
+    canonical = format_mic_hotkey(codes)
+    saved: Dict = {}
+    if MIC_TOGGLE_CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(MIC_TOGGLE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"麦克风配置文件无法读取：{exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("麦克风配置文件格式无效")
+        saved.update(loaded)
+    saved.update(
+        {
+            "hotkey_enabled": bool(enabled),
+            "hotkey": canonical,
+            "hotkey_codes": codes,
+        }
+    )
+    MIC_TOGGLE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = MIC_TOGGLE_CONFIG_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary_path, MIC_TOGGLE_CONFIG_PATH)
+    return bool(enabled), canonical, codes
 
 
 def running_mic_toggle_processes() -> List[Tuple[int, str, str]]:
@@ -1768,6 +1920,31 @@ class SystemToolsTab:
             foreground=THEME["muted"],
         ).pack(anchor=tk.W, pady=(scaled(8, self.scale), 0))
 
+        hotkey_enabled, hotkey_text, _hotkey_codes = read_mic_hotkey_settings()
+        hotkey_box = ttk.LabelFrame(frame, text="麦克风开启/静音快捷键", padding=scaled(12, self.scale))
+        hotkey_box.pack(anchor=tk.W, fill=tk.X, pady=(scaled(12, self.scale), 0))
+        hotkey_row = ttk.Frame(hotkey_box)
+        hotkey_row.pack(anchor=tk.W, fill=tk.X)
+        self.mic_hotkey_enabled_var = tk.BooleanVar(value=hotkey_enabled)
+        self.mic_hotkey_var = tk.StringVar(value=hotkey_text)
+        ttk.Checkbutton(
+            hotkey_row,
+            text="启用快捷键",
+            variable=self.mic_hotkey_enabled_var,
+        ).pack(side=tk.LEFT)
+        self.mic_hotkey_input = ttk.Entry(hotkey_row, textvariable=self.mic_hotkey_var, width=22)
+        self.mic_hotkey_input.pack(side=tk.LEFT, padx=(scaled(12, self.scale), scaled(8, self.scale)))
+        ttk.Button(hotkey_row, text="录制按键", command=self.record_mic_hotkey).pack(side=tk.LEFT)
+        ttk.Button(hotkey_row, text="应用快捷键", command=self.apply_mic_hotkey).pack(
+            side=tk.LEFT,
+            padx=(scaled(8, self.scale), 0),
+        )
+        ttk.Label(
+            hotkey_box,
+            text="支持组合键、F1–F12、MouseX1/MouseX2；关闭后悬浮窗仍显示状态，但按键不会切换麦克风。",
+            foreground=THEME["muted"],
+        ).pack(anchor=tk.W, pady=(scaled(8, self.scale), 0))
+
     def open_admin_powershell7(self) -> None:
         try:
             executable = powershell7_executable()
@@ -1803,6 +1980,82 @@ class SystemToolsTab:
                 self.status_callback(f"麦克风悬浮窗大小已保存为 {saved_percent}%（启动后生效）")
         except Exception as exc:
             messagebox.showerror("设置失败", f"无法保存麦克风悬浮窗大小：{exc}")
+
+    def apply_mic_hotkey(self) -> None:
+        try:
+            enabled, canonical, _codes = save_mic_hotkey_settings(
+                self.mic_hotkey_enabled_var.get(),
+                self.mic_hotkey_var.get(),
+            )
+            self.mic_hotkey_var.set(canonical)
+            state = "已启用" if enabled else "已关闭"
+            suffix = "（约 1 秒内生效）" if self._running_mic_processes() else "（启动后生效）"
+            self.status_callback(f"麦克风快捷键 {canonical} {state}{suffix}")
+        except Exception as exc:
+            messagebox.showerror("设置失败", f"无法保存麦克风快捷键：{exc}")
+
+    def record_mic_hotkey(self) -> None:
+        if getattr(self, "_mic_hotkey_record_dialog", None):
+            try:
+                self._mic_hotkey_record_dialog.lift()
+                return
+            except tk.TclError:
+                self._mic_hotkey_record_dialog = None
+
+        dialog = tk.Toplevel(self.parent)
+        self._mic_hotkey_record_dialog = dialog
+        dialog.title("录制麦克风快捷键")
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+        dialog.transient(self.parent.winfo_toplevel())
+        content = ttk.Frame(dialog, padding=scaled(18, self.scale))
+        content.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            content,
+            text="先松开当前按键，再按下新的快捷键组合。",
+            font=("Microsoft YaHei UI", scaled(13, self.scale), "bold"),
+        ).pack()
+        preview = ttk.Label(content, text="请松开鼠标和键盘…", foreground=THEME["accent"])
+        preview.pack(pady=(scaled(12, self.scale), 0))
+
+        armed = False
+        stable_codes: List[int] = []
+        stable_count = 0
+
+        def close_dialog() -> None:
+            self._mic_hotkey_record_dialog = None
+            dialog.destroy()
+
+        def tick() -> None:
+            nonlocal armed, stable_codes, stable_count
+            if not dialog.winfo_exists():
+                return
+            codes = [code for code in MIC_HOTKEY_SCAN_ORDER if win32api.GetAsyncKeyState(code) & 0x8000]
+            if not armed:
+                if not codes:
+                    armed = True
+                    preview.configure(text="等待输入…")
+                dialog.after(35, tick)
+                return
+            if codes:
+                canonical = format_mic_hotkey(codes)
+                preview.configure(text=canonical)
+                if codes == stable_codes:
+                    stable_count += 1
+                else:
+                    stable_codes = codes
+                    stable_count = 0
+                if stable_count >= 8:
+                    self.mic_hotkey_var.set(canonical)
+                    close_dialog()
+                    return
+            else:
+                stable_codes = []
+                stable_count = 0
+            dialog.after(35, tick)
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        tick()
 
     def open_mic_toggle(self) -> None:
         if self._running_mic_processes():

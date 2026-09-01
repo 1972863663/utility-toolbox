@@ -22,6 +22,7 @@ DEFAULT_OVERLAY_SCALE = 0.75
 MIN_OVERLAY_SCALE = 0.60
 MAX_OVERLAY_SCALE = 1.20
 DEFAULT_CONFIG = {
+    "hotkey_enabled": True,
     "hotkey": "Ctrl+Alt+M",
     "hotkey_codes": [0x11, 0x12, 0x4D],
     "overlay_scale": DEFAULT_OVERLAY_SCALE,
@@ -205,6 +206,8 @@ def load_config() -> dict:
         codes = parse_hotkey_text(str(config.get("hotkey") or DEFAULT_CONFIG["hotkey"]))
     config["hotkey_codes"] = codes or list(DEFAULT_CONFIG["hotkey_codes"])
     config["hotkey"] = format_hotkey(config["hotkey_codes"])
+    if not isinstance(config.get("hotkey_enabled"), bool):
+        config["hotkey_enabled"] = DEFAULT_CONFIG["hotkey_enabled"]
     config["overlay_scale"] = normalize_overlay_scale(config.get("overlay_scale"))
     return config
 
@@ -740,7 +743,7 @@ class MicToggleApp:
     def _build_menu(self) -> None:
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="立即切换麦克风", command=self.on_toggle)
-        self.menu.add_command(label=f"设置热键（当前：{self.config['hotkey']}）", command=self.record_hotkey)
+        self.menu.add_command(label=self.hotkey_menu_label(), command=self.record_hotkey)
         self.menu.add_command(label="放回右上角", command=self.overlay.place_top_right)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
@@ -750,7 +753,11 @@ class MicToggleApp:
         self.menu.tk_popup(event.x_root, event.y_root)
 
     def refresh_menu(self) -> None:
-        self.menu.entryconfigure(1, label=f"设置热键（当前：{self.config['hotkey']}）")
+        self.menu.entryconfigure(1, label=self.hotkey_menu_label())
+
+    def hotkey_menu_label(self) -> str:
+        state = "已启用" if self.config.get("hotkey_enabled", True) else "已关闭"
+        return f"设置热键（{state}：{self.config['hotkey']}）"
 
     def record_hotkey(self) -> None:
         if self.recording:
@@ -782,6 +789,7 @@ class MicToggleApp:
         stable_count = 0
 
         def finish(codes: list[int]) -> None:
+            self.config["hotkey_enabled"] = True
             self.config["hotkey_codes"] = codes
             self.config["hotkey"] = format_hotkey(codes)
             save_config(self.config)
@@ -843,7 +851,8 @@ class MicToggleApp:
 
     def poll_hotkey(self) -> None:
         codes = self.config.get("hotkey_codes") or []
-        active = bool(codes) and all(key_down(code) for code in codes)
+        enabled = self.config.get("hotkey_enabled", True)
+        active = bool(enabled and codes) and all(key_down(code) for code in codes)
         if active and not self.hotkey_was_down and not self.recording:
             self.on_toggle()
         self.hotkey_was_down = active
