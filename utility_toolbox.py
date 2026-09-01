@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import threading
 import time
 import uuid
 import webbrowser
+import winreg
 import zipfile
 import ctypes
 from ctypes import wintypes
@@ -392,6 +394,7 @@ MIC_OVERLAY_MIN_SCALE = 0.60
 MIC_OVERLAY_MAX_SCALE = 1.20
 MIC_HOTKEY_DEFAULT_ENABLED = True
 MIC_HOTKEY_DEFAULT_CODES = [0x11, 0x12, 0x4D]
+MIC_TARGET_DEFAULT_LABEL = "跟随 Windows 当前默认输入"
 MIC_HOTKEY_KEY_NAMES: Dict[int, str] = {
     0x01: "MouseLeft",
     0x02: "MouseRight",
@@ -579,6 +582,49 @@ def save_mic_hotkey_settings(enabled: bool, hotkey_text: str) -> Tuple[bool, str
     temporary_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary_path, MIC_TOGGLE_CONFIG_PATH)
     return bool(enabled), canonical, codes
+
+
+def read_mic_target_settings() -> Tuple[str, str]:
+    saved: Dict = {}
+    try:
+        loaded = json.loads(MIC_TOGGLE_CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            saved.update(loaded)
+    except (OSError, ValueError, TypeError):
+        pass
+    endpoint_id = saved.get("target_endpoint_id")
+    device_name = saved.get("target_device_name")
+    return (
+        endpoint_id if isinstance(endpoint_id, str) else "",
+        device_name if isinstance(device_name, str) and device_name.strip() else MIC_TARGET_DEFAULT_LABEL,
+    )
+
+
+def save_mic_target_settings(endpoint_id: str, device_name: str) -> Tuple[str, str]:
+    normalized_id = endpoint_id.strip()
+    normalized_name = device_name.strip() if normalized_id else MIC_TARGET_DEFAULT_LABEL
+    if normalized_id and not normalized_name:
+        raise ValueError("麦克风名称不能为空")
+    saved: Dict = {}
+    if MIC_TOGGLE_CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(MIC_TOGGLE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"麦克风配置文件无法读取：{exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("麦克风配置文件格式无效")
+        saved.update(loaded)
+    saved.update(
+        {
+            "target_endpoint_id": normalized_id,
+            "target_device_name": normalized_name,
+        }
+    )
+    MIC_TOGGLE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = MIC_TOGGLE_CONFIG_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary_path, MIC_TOGGLE_CONFIG_PATH)
+    return normalized_id, normalized_name
 
 
 def running_mic_toggle_processes() -> List[Tuple[int, str, str]]:
@@ -1678,6 +1724,8 @@ AUDIO_DEVICES = [
 ]
 CLSCTX_ALL = 23
 E_RENDER = 0
+E_CAPTURE = 1
+DEVICE_STATE_ACTIVE = 0x00000001
 ROLE_CONSOLE = 0
 ROLE_MULTIMEDIA = 1
 ROLE_COMMUNICATIONS = 2
@@ -1737,6 +1785,74 @@ def create_com_object(clsid: str, iid: str) -> ctypes.c_void_p:
         "CoCreateInstance",
     )
     return result
+
+
+CAPTURE_DEVICE_REGISTRY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+ENDPOINT_NAME_PROPERTY = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+
+
+def endpoint_registry_id(endpoint_id: str) -> str:
+    match = re.search(r"(\{[0-9A-Fa-f-]{36}\})$", endpoint_id)
+    return match.group(1) if match else endpoint_id
+
+
+def capture_device_name(endpoint_id: str) -> str:
+    key_path = f"{CAPTURE_DEVICE_REGISTRY}\\{endpoint_registry_id(endpoint_id)}\\Properties"
+    access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, access) as key:
+            value, _value_type = winreg.QueryValueEx(key, ENDPOINT_NAME_PROPERTY)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except OSError:
+        pass
+    return "未命名麦克风"
+
+
+def enumerate_active_capture_devices() -> List[Dict[str, str]]:
+    ole32.CoInitialize(None)
+    enumerator = ctypes.c_void_p()
+    collection = ctypes.c_void_p()
+    try:
+        enumerator = create_com_object(
+            "BCDE0395-E52F-467C-8E3D-C4579291692E",
+            "A95664D2-9614-4F35-A746-DE8DB63617E6",
+        )
+        enum_endpoints = com_method(
+            enumerator,
+            3,
+            ctypes.c_long,
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        check_hr(
+            enum_endpoints(enumerator, E_CAPTURE, DEVICE_STATE_ACTIVE, ctypes.byref(collection)),
+            "EnumAudioEndpoints",
+        )
+        count = ctypes.c_uint()
+        get_count = com_method(collection, 3, ctypes.c_long, ctypes.POINTER(ctypes.c_uint))
+        check_hr(get_count(collection, ctypes.byref(count)), "IMMDeviceCollection.GetCount")
+        item = com_method(collection, 4, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))
+        devices: List[Dict[str, str]] = []
+        for index in range(count.value):
+            device = ctypes.c_void_p()
+            raw_id = ctypes.c_wchar_p()
+            try:
+                check_hr(item(collection, index, ctypes.byref(device)), "IMMDeviceCollection.Item")
+                get_id = com_method(device, 5, ctypes.c_long, ctypes.POINTER(ctypes.c_wchar_p))
+                check_hr(get_id(device, ctypes.byref(raw_id)), "IMMDevice.GetId")
+                endpoint_id = raw_id.value or ""
+                devices.append({"id": endpoint_id, "name": capture_device_name(endpoint_id)})
+            finally:
+                if raw_id:
+                    ole32.CoTaskMemFree(raw_id)
+                release(device)
+        return devices
+    finally:
+        release(collection)
+        release(enumerator)
+        ole32.CoUninitialize()
 
 
 def get_default_render_id() -> str:
@@ -1893,6 +2009,34 @@ class SystemToolsTab:
             command=self.close_mic_toggle,
         ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
 
+        target_box = ttk.LabelFrame(frame, text="选择要静音的麦克风", padding=scaled(12, self.scale))
+        target_box.pack(anchor=tk.W, fill=tk.X, pady=(scaled(14, self.scale), 0))
+        target_row = ttk.Frame(target_box)
+        target_row.pack(anchor=tk.W, fill=tk.X)
+        self.mic_target_var = tk.StringVar(value=MIC_TARGET_DEFAULT_LABEL)
+        self.mic_target_choices: Dict[str, Dict[str, str]] = {}
+        self.mic_target_combo = ttk.Combobox(
+            target_row,
+            textvariable=self.mic_target_var,
+            state="readonly",
+            width=42,
+        )
+        self.mic_target_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(target_row, text="刷新列表", command=self.refresh_mic_devices).pack(
+            side=tk.LEFT,
+            padx=(scaled(8, self.scale), 0),
+        )
+        ttk.Button(target_row, text="应用目标", command=self.apply_mic_target).pack(
+            side=tk.LEFT,
+            padx=(scaled(8, self.scale), 0),
+        )
+        ttk.Label(
+            target_box,
+            text="选择具体设备后只控制它；选择“跟随 Windows 当前默认输入”则继续自动跟随系统默认麦克风。",
+            foreground=THEME["muted"],
+        ).pack(anchor=tk.W, pady=(scaled(8, self.scale), 0))
+        self.refresh_mic_devices(show_status=False)
+
         size_box = ttk.LabelFrame(frame, text="麦克风悬浮窗大小", padding=scaled(12, self.scale))
         size_box.pack(anchor=tk.W, fill=tk.X, pady=(scaled(14, self.scale), 0))
         size_row = ttk.Frame(size_box)
@@ -1980,6 +2124,48 @@ class SystemToolsTab:
                 self.status_callback(f"麦克风悬浮窗大小已保存为 {saved_percent}%（启动后生效）")
         except Exception as exc:
             messagebox.showerror("设置失败", f"无法保存麦克风悬浮窗大小：{exc}")
+
+    def refresh_mic_devices(self, show_status: bool = True) -> None:
+        try:
+            selected_id, selected_name = read_mic_target_settings()
+            devices = enumerate_active_capture_devices()
+            choices: Dict[str, Dict[str, str]] = {
+                MIC_TARGET_DEFAULT_LABEL: {"id": "", "name": MIC_TARGET_DEFAULT_LABEL}
+            }
+            selected_label = MIC_TARGET_DEFAULT_LABEL
+            for device in devices:
+                label = device["name"]
+                if label in choices:
+                    short_id = endpoint_registry_id(device["id"]).strip("{}")[:8]
+                    label = f"{label} · {short_id}"
+                choices[label] = device
+                if selected_id and device["id"].casefold() == selected_id.casefold():
+                    selected_label = label
+            if selected_id and selected_label == MIC_TARGET_DEFAULT_LABEL:
+                selected_label = f"{selected_name}（当前未连接）"
+                choices[selected_label] = {"id": selected_id, "name": selected_name}
+            self.mic_target_choices = choices
+            self.mic_target_combo.configure(values=list(choices))
+            self.mic_target_var.set(selected_label)
+            if show_status:
+                self.status_callback(f"已刷新麦克风列表，共 {len(devices)} 个可用设备")
+        except Exception as exc:
+            messagebox.showerror("刷新失败", f"无法读取麦克风设备：{exc}")
+
+    def apply_mic_target(self) -> None:
+        try:
+            label = self.mic_target_var.get()
+            target = self.mic_target_choices.get(label)
+            if target is None:
+                raise ValueError("请先从列表中选择麦克风")
+            endpoint_id, device_name = save_mic_target_settings(target["id"], target["name"])
+            suffix = "（约 1 秒内生效）" if self._running_mic_processes() else "（启动后生效）"
+            if endpoint_id:
+                self.status_callback(f"快捷键目标已设置为：{device_name}{suffix}")
+            else:
+                self.status_callback(f"快捷键目标已设置为：{MIC_TARGET_DEFAULT_LABEL}{suffix}")
+        except Exception as exc:
+            messagebox.showerror("设置失败", f"无法保存麦克风目标：{exc}")
 
     def apply_mic_hotkey(self) -> None:
         try:

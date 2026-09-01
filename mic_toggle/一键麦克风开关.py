@@ -26,6 +26,8 @@ DEFAULT_CONFIG = {
     "hotkey": "Ctrl+Alt+M",
     "hotkey_codes": [0x11, 0x12, 0x4D],
     "overlay_scale": DEFAULT_OVERLAY_SCALE,
+    "target_endpoint_id": "",
+    "target_device_name": "跟随 Windows 当前默认输入",
 }
 MUTEX_NAME = "Global\\MicToggleHotkeySingleInstance"
 
@@ -208,6 +210,10 @@ def load_config() -> dict:
     config["hotkey"] = format_hotkey(config["hotkey_codes"])
     if not isinstance(config.get("hotkey_enabled"), bool):
         config["hotkey_enabled"] = DEFAULT_CONFIG["hotkey_enabled"]
+    if not isinstance(config.get("target_endpoint_id"), str):
+        config["target_endpoint_id"] = ""
+    if not isinstance(config.get("target_device_name"), str) or not config["target_device_name"].strip():
+        config["target_device_name"] = DEFAULT_CONFIG["target_device_name"]
     config["overlay_scale"] = normalize_overlay_scale(config.get("overlay_scale"))
     return config
 
@@ -477,20 +483,44 @@ def capture_device_name(endpoint_id: str) -> str:
     return FALLBACK_DEVICE_NAME
 
 
-def get_default_capture_endpoint_volume(role: int = DEFAULT_CAPTURE_ROLE) -> tuple[ctypes.c_void_p, str]:
+def get_capture_endpoint_volume(
+    role: int = DEFAULT_CAPTURE_ROLE,
+    endpoint_id: str = "",
+) -> tuple[ctypes.c_void_p, str]:
     enumerator = create_com_object("BCDE0395-E52F-467C-8E3D-C4579291692E", "A95664D2-9614-4F35-A746-DE8DB63617E6")
     device = ctypes.c_void_p()
     endpoint = ctypes.c_void_p()
-    endpoint_id = ""
+    requested_endpoint_id = endpoint_id
+    resolved_endpoint_id = ""
     try:
-        get_default = com_method(enumerator, 4, ctypes.c_long, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
-        check_hr(get_default(enumerator, E_CAPTURE, role, ctypes.byref(device)), "GetDefaultAudioEndpoint")
+        if requested_endpoint_id:
+            get_device = com_method(
+                enumerator,
+                5,
+                ctypes.c_long,
+                ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            check_hr(
+                get_device(enumerator, requested_endpoint_id, ctypes.byref(device)),
+                "IMMDeviceEnumerator.GetDevice",
+            )
+        else:
+            get_default = com_method(
+                enumerator,
+                4,
+                ctypes.c_long,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            check_hr(get_default(enumerator, E_CAPTURE, role, ctypes.byref(device)), "GetDefaultAudioEndpoint")
 
         raw_id = ctypes.c_wchar_p()
         try:
             get_id = com_method(device, 5, ctypes.c_long, ctypes.POINTER(ctypes.c_wchar_p))
             check_hr(get_id(device, ctypes.byref(raw_id)), "IMMDevice.GetId")
-            endpoint_id = raw_id.value or ""
+            resolved_endpoint_id = raw_id.value or ""
         finally:
             if raw_id:
                 ole32.CoTaskMemFree(raw_id)
@@ -506,7 +536,7 @@ def get_default_capture_endpoint_volume(role: int = DEFAULT_CAPTURE_ROLE) -> tup
         )
         endpoint_iid = GUID.from_string("5CDF2C82-841E-4546-9722-0CF74078229A")
         check_hr(activate(device, ctypes.byref(endpoint_iid), CLSCTX_ALL, None, ctypes.byref(endpoint)), "IMMDevice.Activate")
-        return endpoint, endpoint_id
+        return endpoint, resolved_endpoint_id
     finally:
         release(device)
         release(enumerator)
@@ -525,12 +555,12 @@ def set_endpoint_muted(endpoint: ctypes.c_void_p, muted: bool) -> None:
     check_hr(set_mute(endpoint, wintypes.BOOL(1 if muted else 0), ctypes.byref(event_context)), "IAudioEndpointVolume.SetMute")
 
 
-def get_mic_status(role: int = DEFAULT_CAPTURE_ROLE) -> tuple[bool, str, str]:
+def get_mic_status(role: int = DEFAULT_CAPTURE_ROLE, endpoint_id: str = "") -> tuple[bool, str, str]:
     ole32.CoInitialize(None)
     endpoint = ctypes.c_void_p()
     try:
-        endpoint, endpoint_id = get_default_capture_endpoint_volume(role)
-        return endpoint_is_muted(endpoint), capture_device_name(endpoint_id), endpoint_id
+        endpoint, resolved_id = get_capture_endpoint_volume(role, endpoint_id)
+        return endpoint_is_muted(endpoint), capture_device_name(resolved_id), resolved_id
     finally:
         release(endpoint)
         ole32.CoUninitialize()
@@ -540,32 +570,32 @@ def get_mic_muted(role: int = DEFAULT_CAPTURE_ROLE) -> bool:
     return get_mic_status(role)[0]
 
 
-def set_mic_muted(muted: bool, role: int = DEFAULT_CAPTURE_ROLE) -> None:
+def set_mic_muted(muted: bool, role: int = DEFAULT_CAPTURE_ROLE, endpoint_id: str = "") -> None:
     ole32.CoInitialize(None)
     endpoint = ctypes.c_void_p()
     try:
-        endpoint, _endpoint_id = get_default_capture_endpoint_volume(role)
+        endpoint, _endpoint_id = get_capture_endpoint_volume(role, endpoint_id)
         set_endpoint_muted(endpoint, muted)
     finally:
         release(endpoint)
         ole32.CoUninitialize()
 
 
-def toggle_mic_status(role: int = DEFAULT_CAPTURE_ROLE) -> tuple[bool, str, str]:
+def toggle_mic_status(role: int = DEFAULT_CAPTURE_ROLE, endpoint_id: str = "") -> tuple[bool, str, str]:
     ole32.CoInitialize(None)
     endpoint = ctypes.c_void_p()
     try:
-        endpoint, endpoint_id = get_default_capture_endpoint_volume(role)
+        endpoint, resolved_id = get_capture_endpoint_volume(role, endpoint_id)
         muted = not endpoint_is_muted(endpoint)
         set_endpoint_muted(endpoint, muted)
-        return muted, capture_device_name(endpoint_id), endpoint_id
+        return muted, capture_device_name(resolved_id), resolved_id
     finally:
         release(endpoint)
         ole32.CoUninitialize()
 
 
-def toggle_mic(role: int = DEFAULT_CAPTURE_ROLE) -> bool:
-    return toggle_mic_status(role)[0]
+def toggle_mic(role: int = DEFAULT_CAPTURE_ROLE, endpoint_id: str = "") -> bool:
+    return toggle_mic_status(role, endpoint_id)[0]
 
 
 class StatusOverlay:
@@ -826,7 +856,9 @@ class MicToggleApp:
 
     def _toggle_worker(self) -> None:
         try:
-            muted, device_name, _endpoint_id = toggle_mic_status()
+            muted, device_name, _endpoint_id = toggle_mic_status(
+                endpoint_id=self.config.get("target_endpoint_id", "")
+            )
             self.root.after(0, lambda: self.overlay.set_state(muted, device_name))
         except Exception as exc:
             self.root.after(0, lambda: messagebox.showerror(APP_NAME, f"切换麦克风失败：{exc}"))
@@ -844,7 +876,9 @@ class MicToggleApp:
 
     def _poll_worker(self) -> None:
         try:
-            muted, device_name, _endpoint_id = get_mic_status()
+            muted, device_name, _endpoint_id = get_mic_status(
+                endpoint_id=self.config.get("target_endpoint_id", "")
+            )
             self.root.after(0, lambda: self.overlay.set_state(muted, device_name))
         except Exception:
             self.root.after(0, self.overlay.set_error)

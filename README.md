@@ -33,7 +33,7 @@ If Windows Explorer or the taskbar restarts, the toolbox automatically restores 
 
 The helper is intentionally mouse-click-through so it does not block game clicks, cannot be dragged accidentally, and does not respond to mouse clicks by default.
 
-The mute hotkey resolves the current Windows primary default capture endpoint on every operation instead of using the separate default communications device. The overlay shows that device's name and reloads its saved settings while running. In the toolbox, open `系统工具` to enable or disable the global microphone hotkey, type or record a custom keyboard/mouse combination, and choose a proportional overlay scale from 60% to 120%; the default hotkey is `Ctrl+Alt+M` and the default scale is 75%.
+The mute hotkey can either follow the current Windows primary default capture endpoint or lock onto a specific active microphone selected in `系统工具 → 选择要静音的麦克风`. The overlay shows the controlled device's name and reloads its saved settings while running. The same page can enable or disable the global hotkey, type or record a custom keyboard/mouse combination, and choose a proportional overlay scale from 60% to 120%; the default target follows Windows, the default hotkey is `Ctrl+Alt+M`, and the default scale is 75%.
 
 Build the helper into the local workspace with:
 

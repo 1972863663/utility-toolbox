@@ -86,6 +86,34 @@ def test_save_mic_hotkey_settings_preserves_overlay_scale(tmp_path: Path, monkey
     assert toolbox.read_mic_hotkey_settings() == (False, "MouseX1", [0x05])
 
 
+def test_save_mic_target_settings_preserves_other_settings(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "MicToggleHotkey" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "hotkey_enabled": True,
+                "hotkey": "MouseX2",
+                "hotkey_codes": [0x06],
+                "overlay_scale": 0.75,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(toolbox, "MIC_TOGGLE_CONFIG_PATH", config_path)
+    endpoint_id = "{0.0.1.00000000}.{test-device}"
+
+    saved_target = toolbox.save_mic_target_settings(endpoint_id, "测试麦克风")
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert saved_target == (endpoint_id, "测试麦克风")
+    assert toolbox.read_mic_target_settings() == (endpoint_id, "测试麦克风")
+    assert saved["hotkey"] == "MouseX2"
+    assert saved["hotkey_codes"] == [0x06]
+    assert saved["overlay_scale"] == 0.75
+
+
 def test_mic_helper_loads_disabled_hotkey(tmp_path: Path, monkeypatch) -> None:
     helper = load_mic_toggle_module()
     config_path = tmp_path / "MicToggleHotkey" / "config.json"
@@ -128,3 +156,35 @@ def test_mic_helper_disabled_hotkey_does_not_toggle(monkeypatch) -> None:
     assert toggles == []
     assert app.hotkey_was_down is False
     assert scheduled and scheduled[0][0] == 35
+
+
+def test_mic_helper_poll_uses_selected_endpoint(monkeypatch) -> None:
+    helper = load_mic_toggle_module()
+    endpoint_id = "{0.0.1.00000000}.{selected-device}"
+    calls = []
+    states = []
+    app = object.__new__(helper.MicToggleApp)
+    app.config = {"target_endpoint_id": endpoint_id}
+    app.overlay = type("FakeOverlay", (), {"set_state": lambda _self, muted, name: states.append((muted, name))})()
+    app.root = type("FakeRoot", (), {"after": lambda _self, _delay, callback: callback()})()
+    monkeypatch.setattr(
+        helper,
+        "get_mic_status",
+        lambda role=helper.DEFAULT_CAPTURE_ROLE, endpoint_id="": (
+            calls.append((role, endpoint_id)) or (False, "测试麦克风", endpoint_id)
+        ),
+    )
+
+    app._poll_worker()
+
+    assert calls == [(helper.DEFAULT_CAPTURE_ROLE, endpoint_id)]
+    assert states == [(False, "测试麦克风")]
+
+
+def test_mic_helper_resolves_selected_active_endpoint() -> None:
+    helper = load_mic_toggle_module()
+    devices = toolbox.enumerate_active_capture_devices()
+
+    for device in devices:
+        _muted, _name, resolved_id = helper.get_mic_status(endpoint_id=device["id"])
+        assert resolved_id.casefold() == device["id"].casefold()
