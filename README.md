@@ -1,48 +1,47 @@
-﻿# Windows Utility Toolbox
+# Windows 实用工具箱 · 原生毛玻璃版
 
-A local Windows Tkinter utility toolbox packaged with PyInstaller.
+当前版本：**v2026.11.14**。主程序为 `工具箱-毛玻璃版.exe`，源码入口为 `toolbox_glass.py`。
 
-## Key files
+[下载最新版](https://github.com/1972863663/utility-toolbox/releases/latest) · [当前维护说明](docs/PROJECT_HANDOFF.md) · [验证记录](docs/VALIDATION_2026-11-14.md) · [第三方许可](docs/THIRD_PARTY_GLASS.md)
 
-- `docs/PROJECT_HANDOFF.md` - detailed handoff document for maintainers and future agents
+## 使用
 
-- `utility_toolbox.py` - main application
-- `subtitle_sync_embedded.py` - embedded subtitle sync tool
-- `media_organizer/` - media organizer module
-- `UtilityToolbox.spec` - PyInstaller build configuration
-- `icons/utility_toolbox.ico` - application icon
-- `test_launcher_close.py` - drag-to-close/process matching tests
-- `test_autostart.py` - autostart repair tests
-- `test_system_tools.py` - PowerShell and microphone overlay configuration tests
+下载 Release 的 `UtilityToolbox-Glass-v2026.11.14.zip` 并解压后启动主程序。保留完整目录结构，宏和麦克风助手与主程序一起提供。
 
-## Build
+- Windows 原生 Acrylic 毛玻璃；鸿蒙黑体随应用内置，无需安装系统字体。
+- 11 个工具入口：批量重命名、字幕同步、照片视频整理、应用启动器、窗口置顶、麦克风控制、音频输出、宏录制回放、启动与系统、游戏存档、直播入口。
+- 在「外观与窗口」录入唤出快捷键，支持单键和 Ctrl / Alt / Shift 组合键。按一次唤出并置顶，再按一次隐藏到托盘。首次默认 Ctrl+Alt+Space；已有用户设置保留。
+- 关闭窗口隐藏到托盘；退出使用「退出工具箱」。在「启动与系统」中开启登录后自启动，启动参数为 `--minimized-to-tray`。
+- 文件操作先预览再执行，修改输入后需重新预览；界面保留页面输入与撤回记录。
 
-```powershell
-pyinstaller UtilityToolbox.spec --noconfirm
-```
+毛玻璃效果取决于 Windows 版本和系统透明效果设置；应用不会自行修改系统透明设置。
 
-The packaged executable is generated at `dist/UtilityToolbox.exe`.
+## 数据与独立工具
 
-Closing the main window hides the toolbox to the Windows notification area instead of exiting.
-If Windows Explorer or the taskbar restarts, the toolbox automatically restores its tray icon.
+用户设置、字幕历史、宏录制及存档资料保存在 `data/`，升级时请保留。发布包不包含个人配置、录制内容、游戏存档或备份。
 
-## Microphone overlay helper
+- 宏助手：`macro_tools/`。
+- 麦克风助手：`mic_tool_workspace/dist/一键麦克风开关.exe`。
+- 游戏存档入口接入独立的 [Game Save Manager](https://github.com/dyang886/Game-Save-Manager/releases/latest)。发布包不含该第三方完整程序；可在界面中选择其程序位置。本地已有安装和备份无需移动。
+- 宏回放的驱动/权限及设备名称配置依赖实际电脑环境。
 
-- `mic_toggle/一键麦克风开关.py` - click-through microphone status overlay and hotkey toggle helper
-- `mic_toggle/一键麦克风开关.spec` - PyInstaller build configuration for the helper
+## 开发与构建
 
-The helper is intentionally mouse-click-through so it does not block game clicks, cannot be dragged accidentally, and does not respond to mouse clicks by default.
-
-The mute hotkey can either follow the current Windows primary default capture endpoint or lock onto a specific active microphone selected in `系统工具 → 选择要静音的麦克风`. The overlay shows the controlled device's name and reloads its saved settings while running. The same page can enable or disable the global hotkey, type or record a custom keyboard/mouse combination, and choose a proportional overlay scale from 60% to 120%; the default target follows Windows, the default hotkey is `Ctrl+Alt+M`, and the default scale is 75%.
-
-Build the helper into the local workspace with:
+使用 Windows、Python 3.12、PowerShell 7。核心依赖包括 PySide6、pywin32、psutil、Pillow、ImageHash、pillow-heif；源码中保留旧 Tk 业务引擎作为 Qt 适配层的依赖。
 
 ```powershell
-python -m PyInstaller mic_toggle\一键麦克风开关.spec --noconfirm --clean --distpath mic_tool_workspace\dist --workpath mic_tool_workspace\build\mic-toggle
+python toolbox_glass.py
+python -m PyInstaller --noconfirm ToolboxGlass.spec
 ```
 
-## Local consolidated layout
+构建输出 `dist/工具箱-毛玻璃版.exe`。不要删除 `utility_toolbox.py`、`toolbox_ui.py` 等依赖文件；它们不是旧版可执行程序。
 
-On this machine the full working folder is consolidated at `C:\Users\User\Desktop\Python\工具箱`. The runnable toolbox is `工具箱.exe`. The microphone helper workspace is stored locally under `mic_tool_workspace/` and the toolbox looks for `mic_tool_workspace/dist/一键麦克风开关.exe` first after relocation. For full handoff details, see `docs/PROJECT_HANDOFF.md`.
+无鼠标键盘输入的 Qt 验证：
 
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+python -m pytest test_glass_hotkeys.py test_glass_workflows.py -q
+python -m pytest test_glass_toolbox.py -q -k 'not native_summon and not toggle_alternates and not toggle_restores'
+```
 
+完整验证范围和未验证边界见验证记录。构建或运行测试不会自动启用系统自启动。

@@ -1,10 +1,18 @@
 ﻿import json
+import os
+import tempfile
 import time
 import threading
+import sys
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
+
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from toolbox_paths import data_directory
 
 try:
     from pynput import keyboard, mouse
@@ -86,6 +94,16 @@ class MacroRecorder:
         self.lock = threading.RLock()
         self.last_move_time = 0.0
         self.move_throttle_seconds = 0.015
+        self._generation = 0
+
+    def _session_callback(self, generation, callback):
+        def dispatch(*args):
+            with self.lock:
+                if not self.is_recording or generation != self._generation:
+                    return None
+            # Mouse options read a Tk variable; never hold the lock during that read.
+            return callback(*args, generation=generation)
+        return dispatch
 
     def start(self):
         if keyboard is None or mouse is None:
@@ -93,35 +111,61 @@ class MacroRecorder:
         with self.lock:
             if self.is_recording:
                 return
+            # Retry pending cleanup before creating another set of hooks.
+            if self.keyboard_listener is not None or self.mouse_listener is not None:
+                self.stop()
+            self._generation += 1
+            generation = self._generation
+            keyboard_listener = None
+            mouse_listener = None
+            try:
+                keyboard_listener = keyboard.Listener(
+                    on_press=self._session_callback(generation, self._on_key_press),
+                    on_release=self._session_callback(generation, self._on_key_release),
+                )
+                mouse_listener = mouse.Listener(
+                    on_move=self._session_callback(generation, self._on_mouse_move),
+                    on_click=self._session_callback(generation, self._on_mouse_click),
+                    on_scroll=self._session_callback(generation, self._on_mouse_scroll),
+                )
+                keyboard_listener.start()
+                mouse_listener.start()
+            except Exception as start_error:
+                cleanup_errors = []
+                for name, listener in (("keyboard_listener", keyboard_listener), ("mouse_listener", mouse_listener)):
+                    if listener is not None:
+                        try:
+                            listener.stop()
+                        except Exception as exc:
+                            setattr(self, name, listener)
+                            cleanup_errors.append(str(exc))
+                if cleanup_errors:
+                    raise RuntimeError(f"{start_error}；监听器清理失败，可重试停止：{'；'.join(cleanup_errors)}") from start_error
+                raise
+            # Commit only after both hooks start; failed attempts preserve the recording.
+            self.keyboard_listener = keyboard_listener
+            self.mouse_listener = mouse_listener
             self.events.clear()
             self.start_time = time.perf_counter()
             self.last_move_time = 0.0
             self.is_recording = True
-            self.keyboard_listener = keyboard.Listener(
-                on_press=self._on_key_press,
-                on_release=self._on_key_release,
-            )
-            self.mouse_listener = mouse.Listener(
-                on_move=self._on_mouse_move,
-                on_click=self._on_mouse_click,
-                on_scroll=self._on_mouse_scroll,
-            )
-            self.keyboard_listener.start()
-            self.mouse_listener.start()
 
     def stop(self):
         with self.lock:
-            if not self.is_recording:
-                return
             self.is_recording = False
-            kl = self.keyboard_listener
-            ml = self.mouse_listener
-            self.keyboard_listener = None
-            self.mouse_listener = None
-        if kl is not None:
-            kl.stop()
-        if ml is not None:
-            ml.stop()
+            self._generation += 1
+            errors = []
+            for name in ("keyboard_listener", "mouse_listener"):
+                listener = getattr(self, name)
+                if listener is not None:
+                    try:
+                        listener.stop()
+                    except Exception as exc:
+                        errors.append(exc)
+                    else:
+                        setattr(self, name, None)
+            if errors:
+                raise errors[0]
 
     def clear(self):
         with self.lock:
@@ -136,42 +180,45 @@ class MacroRecorder:
             return 0.0
         return round(time.perf_counter() - self.start_time, 6)
 
-    def _add(self, event_type: str, data: Dict[str, Any]):
+    def _add(self, event_type: str, data: Dict[str, Any], generation=None):
         with self.lock:
-            if not self.is_recording:
+            if not self.is_recording or (generation is not None and generation != self._generation):
                 return
             self.events.append(MacroEvent(t=self._elapsed(), type=event_type, data=data))
 
-    def _on_key_press(self, key):
-        self._add("key_press", {"key": key_to_string(key)})
+    def _on_key_press(self, key, generation=None):
+        self._add("key_press", {"key": key_to_string(key)}, generation)
 
-    def _on_key_release(self, key):
-        self._add("key_release", {"key": key_to_string(key)})
+    def _on_key_release(self, key, generation=None):
+        self._add("key_release", {"key": key_to_string(key)}, generation)
 
-    def _on_mouse_move(self, x, y):
+    def _on_mouse_move(self, x, y, generation=None):
         if not self.record_mouse_moves.get():
             return
-        now = time.perf_counter()
-        if now - self.last_move_time < self.move_throttle_seconds:
-            return
-        self.last_move_time = now
-        self._add("mouse_move", {"x": int(x), "y": int(y)})
+        with self.lock:
+            if not self.is_recording or (generation is not None and generation != self._generation):
+                return
+            now = time.perf_counter()
+            if now - self.last_move_time < self.move_throttle_seconds:
+                return
+            self.last_move_time = now
+            self._add("mouse_move", {"x": int(x), "y": int(y)}, generation)
 
-    def _on_mouse_click(self, x, y, button, pressed):
+    def _on_mouse_click(self, x, y, button, pressed, generation=None):
         self._add("mouse_click", {
             "x": int(x),
             "y": int(y),
             "button": mouse_button_to_string(button),
             "pressed": bool(pressed),
-        })
+        }, generation)
 
-    def _on_mouse_scroll(self, x, y, dx, dy):
+    def _on_mouse_scroll(self, x, y, dx, dy, generation=None):
         self._add("mouse_scroll", {
             "x": int(x),
             "y": int(y),
             "dx": int(dx),
             "dy": int(dy),
-        })
+        }, generation)
 
     def export_json(self, path: str, hotkey: str):
         events = self.snapshot()
@@ -183,8 +230,24 @@ class MacroRecorder:
             "event_count": len(events),
             "events": [asdict(e) for e in events],
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        target = Path(path)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            if temporary is not None:
+                active_error = sys.exception()
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    if active_error is None:
+                        raise
+                    active_error.add_note(f"临时文件清理失败：{temporary}: {cleanup_error}")
 
 
 class HotkeyCaptureDialog(tk.Toplevel):
@@ -437,6 +500,9 @@ class MacroRecorderApp(tk.Tk):
                 self.status_var.set("已停止录制")
             else:
                 self.recorder.start()
+                rows = self.tree.get_children()
+                if rows:
+                    self.tree.delete(*rows)
                 self.record_btn.configure(text="停止录制")
                 self.status_var.set("录制中……")
         except Exception as e:
@@ -465,6 +531,7 @@ class MacroRecorderApp(tk.Tk):
             defaultextension=".json",
             filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
             initialfile="macro_recording.json",
+            initialdir=str(data_directory("Macros")),
         )
         if not path:
             return

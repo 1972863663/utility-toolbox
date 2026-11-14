@@ -1,12 +1,14 @@
 import json
 import os
 import re
-import shutil
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from toolbox_paths import data_directory
+from toolbox_ui import THEME, DarkScrolledText
 from typing import Dict, Final, List, Optional, Set, Tuple
 
 import tkinter as tk
@@ -21,7 +23,7 @@ class AppConfig:
     SUB_EXTS: Final[Set[str]] = {".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".sup", ".txt"}
     MEDIA_EXTS: Final[Set[str]] = VIDEO_EXTS | SUB_EXTS
 
-    BASE_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "UtilityToolbox"
+    BASE_DIR = data_directory("UtilityToolbox")
     HISTORY_FILE = BASE_DIR / "subtitle_sync_history.json"
     TMP_HISTORY = BASE_DIR / "subtitle_sync_history.json.tmp"
 
@@ -386,9 +388,16 @@ class MainApp:
     def __init__(self, root: tk.Tk, embedded: bool = False):
         self.root = root
         self.embedded = embedded
+        self.colors = THEME if embedded else {
+            "bg": "#f5f7fb", "panel": "#ffffff", "text": "#1f2937",
+            "muted": "#64748b", "border": "#d7e0ea", "accent": "#2563eb", "selection": "#dbeafe",
+        }
         self.scale = self._current_scale()
-        self.history_db: Dict[str, Dict[str, str]] = {}
+        self.history_db: Dict[str, Dict[str, object]] = {}
+        self._history_read_error = None
+        self._history_loaded_bytes = None
         self.is_running = False
+        self.stop_requested = False
         self.target_dir: Optional[Path] = None
 
         self.setup_ui()
@@ -455,16 +464,16 @@ class MainApp:
         row.columnconfigure(1, weight=1)
         ttk.Label(row, text="项目剧名:", style="App.TLabel").grid(row=0, column=0, padx=5, pady=4, sticky=tk.W)
 
-        placeholder_color = "#64748b"
+        placeholder_color = self.colors["muted"]
         self.name_ent = tk.Entry(
             row,
-            bg="#ffffff",
+            bg=self.colors["panel"],
             fg=placeholder_color,
-            insertbackground="#1f2937",
+            insertbackground=self.colors["text"],
             relief="flat",
             highlightthickness=1,
-            highlightbackground="#d7e0ea",
-            highlightcolor="#2563eb",
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
             font=("Microsoft YaHei UI", self._scale(14)),
         )
         self.name_ent.grid(row=0, column=1, padx=5, pady=4, ipady=self._scale(5), sticky=tk.EW)
@@ -480,13 +489,13 @@ class MainApp:
             justify="center",
             validate="key",
             validatecommand=(validate_season, "%P"),
-            bg="#ffffff",
-            fg="#1f2937",
-            insertbackground="#1f2937",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
             relief="flat",
             highlightthickness=1,
-            highlightbackground="#d7e0ea",
-            highlightcolor="#2563eb",
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
             font=("Microsoft YaHei UI", self._scale(14)),
         )
         self.season_ent.grid(row=0, column=3, padx=5, pady=4, ipady=self._scale(5), sticky=tk.EW)
@@ -528,22 +537,25 @@ class MainApp:
         )
         self.btn_undo.grid(row=1, column=2, padx=5, pady=4, sticky=tk.EW)
 
-        self.log_area = scrolledtext.ScrolledText(
+        log_widget = DarkScrolledText if self.embedded else scrolledtext.ScrolledText
+        self.log_area = log_widget(
             container,
-            height=20,
+            height=10 if self.embedded else 20,
             font=("Consolas", self._scale(14)),
-            bg="#ffffff",
-            fg="#1f2937",
-            insertbackground="#1f2937",
-            selectbackground="#dbeafe",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            selectbackground=self.colors["selection"],
             borderwidth=0,
             highlightthickness=1,
-            highlightbackground="#d7e0ea",
+            highlightbackground=self.colors["border"],
         )
         self.log_area.pack(fill=tk.BOTH, expand=True, pady=10)
         self._init_log_styles()
 
     def _setup_theme(self):
+        if self.embedded:
+            return  # The host owns the shared ttk styles.
         self.root.configure(bg="#f5f7fb")
         style = ttk.Style(self.root)
         try:
@@ -578,19 +590,25 @@ class MainApp:
             "warn": "#b45309",
             "audit": "#be185d",
         }
+        if self.embedded:
+            styles.update(vid=THEME["accent"], sub=THEME["success"], success=THEME["success"],
+                          err=THEME["danger"], info="#b69afa", warn="#e9bd79", audit="#e79bc5")
         for tag, color in styles.items():
             self.log_area.tag_config(tag, foreground=color)
 
     def _on_focus_in(self, _event):
         if self.name_ent.get() == AppConfig.PLACEHOLDER_TEXT:
             self.name_ent.delete(0, tk.END)
-            self.name_ent.config(fg="#1f2937")
+            self.name_ent.config(fg=self.colors["text"])
 
     def _on_focus_out(self, _event):
         raw = self.name_ent.get().strip()
-        if raw:
+        if raw and raw != AppConfig.PLACEHOLDER_TEXT:
             return
-        placeholder_color = "#64748b"
+        if raw == AppConfig.PLACEHOLDER_TEXT:
+            self.name_ent.config(fg=self.colors["muted"])
+            return
+        placeholder_color = self.colors["muted"]
         self.name_ent.config(fg=placeholder_color)
         self.name_ent.insert(0, AppConfig.PLACEHOLDER_TEXT)
 
@@ -624,15 +642,16 @@ class MainApp:
         self.log_area.delete("1.0", tk.END)
 
     def select_dir(self):
+        if self.is_running:
+            return
         directory = filedialog.askdirectory()
         if not directory:
             return
 
         path = Path(directory)
-        probe = path / ".permission_probe.tmp"
         try:
-            probe.touch()
-            probe.unlink()
+            with tempfile.TemporaryFile(dir=path, prefix=".permission_probe_"):
+                pass
         except OSError:
             messagebox.showerror("系统拦截", f"文件夹拒绝访问或受写保护：{directory}\n请检查权限或更换目录。")
             return
@@ -644,7 +663,7 @@ class MainApp:
         self.safe_ui(self.btn_undo, state=undo_state)
 
     def stop_task(self):
-        self.is_running = False
+        self.stop_requested = True
         self.safe_log("正在停止任务，当前文件处理完成后会退出队列。", "warn")
 
     def _read_inputs(self) -> Optional[Tuple[str, int, bool, Path]]:
@@ -683,19 +702,32 @@ class MainApp:
             return
 
         show_name, fallback_season, is_dry_run, current_dir = inputs
+        self.stop_requested = False
         self.is_running = True
         self.safe_ui(self.btn_run, state=tk.DISABLED)
         self.safe_ui(self.btn_audit, state=tk.DISABLED)
+        self.safe_ui(self.btn_undo, state=tk.DISABLED)
         self.safe_ui(self.btn_stop, state=tk.NORMAL)
-        threading.Thread(
-            target=self.batch_worker,
-            args=(show_name, fallback_season, is_dry_run, current_dir),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self.batch_worker,
+                args=(show_name, fallback_season, is_dry_run, current_dir),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self.is_running = False
+            self.safe_ui(self.btn_run, state=tk.NORMAL)
+            self.safe_ui(self.btn_audit, state=tk.NORMAL)
+            self.safe_ui(self.btn_stop, state=tk.DISABLED)
+            self.safe_ui(self.btn_undo, state=tk.NORMAL if self.history_db.get(current_dir.as_posix()) else tk.DISABLED)
+            self.safe_log(f"任务启动失败：{exc}", "err")
 
     def batch_worker(self, show_name: str, fallback_season: int, is_dry_run: bool, current_dir: Path):
         folder_key = current_dir.as_posix()
         try:
+            self._validate_history(self.history_db)
+            if not is_dry_run and not self._save_history_db():
+                return
             files = [item for item in current_dir.iterdir() if item.is_file() and item.suffix.lower() in AppConfig.MEDIA_EXTS]
             plan = RenameLogic.build_plan(files, show_name, fallback_season)
             self.safe_ui(self.progress, val=0, maximum=max(len(plan), 1))
@@ -708,7 +740,7 @@ class MainApp:
                 self.history_db[folder_key] = {}
 
             for index, item in enumerate(plan, 1):
-                if not self.is_running:
+                if not self.is_running or self.stop_requested:
                     self.safe_log("任务已停止。", "warn")
                     break
 
@@ -736,8 +768,35 @@ class MainApp:
                 try:
                     if item.target.exists():
                         raise FileExistsError(f"目标文件已存在：{item.target.name}")
-                    shutil.move(str(item.source), str(item.target))
-                    self.history_db[folder_key][item.target.name] = item.source.name
+                    identity = item.source.stat()
+                    file_identity = [identity.st_dev, identity.st_ino]
+                    mapping = self.history_db[folder_key]
+                    if item.target.name in mapping:
+                        raise FileExistsError(f"目标名称仍有待恢复记录，请先撤销：{item.target.name}")
+                    previous_record = mapping.get(item.source.name)
+                    if isinstance(previous_record, str):
+                        raise OSError(f"旧历史缺少文件身份，无法安全继续改名，请先撤销：{item.source.name}")
+                    previous_mapping = self.history_db[folder_key].copy()
+                    original_name = item.source.name
+                    if isinstance(previous_record, dict) and previous_record["identity"] == file_identity:
+                        original_name = previous_record["old"]
+                        mapping.pop(item.source.name)
+                    mapping[item.target.name] = {
+                        "old": original_name, "source": item.source.name,
+                        "identity": file_identity,
+                    }
+                    if not self._save_history_db():
+                        self.history_db[folder_key] = previous_mapping
+                        summary["failed"] += 1
+                        break
+                    # Same-directory Windows rename refuses a racing destination;
+                    # shutil.move falls back to copy and can overwrite that file.
+                    try:
+                        item.source.rename(item.target)
+                    except OSError:
+                        self.history_db[folder_key] = previous_mapping
+                        self._save_history_db()
+                        raise
                     summary["done"] += 1
                     self.safe_log(f"完成：{item.target.name}", "success")
                 except PermissionError:
@@ -747,14 +806,13 @@ class MainApp:
                     summary["failed"] += 1
                     self.safe_log(f"失败：{item.source.name} -> {exc}", "err")
 
-            if not is_dry_run:
-                self._save_history_db()
-
             self.safe_log(
                 f"完成统计：可改名 {summary['ready']}，已执行 {summary['done']}，"
                 f"已符合 {summary['same']}，跳过 {summary['skip']}，冲突 {summary['conflict']}，失败 {summary['failed']}",
                 "success" if summary["failed"] == 0 and summary["conflict"] == 0 else "warn",
             )
+        except Exception as exc:
+            self.safe_log(f"任务失败：{exc}", "err")
         finally:
             self.is_running = False
             self.safe_ui(self.btn_run, state=tk.NORMAL)
@@ -779,11 +837,19 @@ class MainApp:
 
         self.clear_log()
         self.safe_log("开始校对视频与字幕映射。", "audit")
+        self.stop_requested = False
         self.is_running = True
         self.safe_ui(self.btn_run, state=tk.DISABLED)
         self.safe_ui(self.btn_audit, state=tk.DISABLED)
         self.safe_ui(self.btn_stop, state=tk.NORMAL)
-        threading.Thread(target=self.audit_worker, args=(self.target_dir, fallback_season), daemon=True).start()
+        try:
+            threading.Thread(target=self.audit_worker, args=(self.target_dir, fallback_season), daemon=True).start()
+        except Exception as exc:
+            self.is_running = False
+            self.safe_ui(self.btn_run, state=tk.NORMAL)
+            self.safe_ui(self.btn_audit, state=tk.NORMAL)
+            self.safe_ui(self.btn_stop, state=tk.DISABLED)
+            self.safe_log(f"校对启动失败：{exc}", "err")
 
     def audit_worker(self, current_dir: Path, fallback_season: int):
         try:
@@ -792,9 +858,9 @@ class MainApp:
             results: Dict[Tuple[int, int], Dict[str, List[Path]]] = {}
 
             for index, file_path in enumerate(sorted(files, key=RenameLogic.natural_key), 1):
-                if not self.is_running:
+                if not self.is_running or self.stop_requested:
                     self.safe_log("校对已停止。", "warn")
-                    break
+                    return
                 parsed = RenameLogic.parse_file(file_path.name, fallback_season)
                 if parsed.episode is not None:
                     key = (parsed.season, parsed.episode)
@@ -818,12 +884,17 @@ class MainApp:
                 if len(group["s"]) > 1:
                     issues.append((f"同一集存在多个字幕：{season_ep}", "warn"))
 
+            if not self.is_running or self.stop_requested:
+                self.safe_log("校对已停止。", "warn")
+                return
             if not issues:
                 self.safe_log("校对通过：视频与字幕已能按集数匹配。", "success")
             else:
                 for message, tag in issues:
                     self.safe_log(message, tag)
                 self.safe_log(f"校对完成：发现 {len(issues)} 个问题。", "warn")
+        except Exception as exc:
+            self.safe_log(f"校对失败：{exc}", "err")
         finally:
             self.is_running = False
             self.safe_ui(self.btn_run, state=tk.NORMAL)
@@ -832,28 +903,75 @@ class MainApp:
             self.safe_ui(self.progress, val=0, maximum=100)
             AppConfig.word_re.cache_clear()
 
+    @staticmethod
+    def _validate_history(data):
+        if not isinstance(data, dict):
+            raise ValueError("历史记录必须是目录映射对象")
+        for folder, mapping in data.items():
+            if not isinstance(folder, str) or not folder or not isinstance(mapping, dict):
+                raise ValueError("历史记录中的目录映射无效")
+            for new_name, record in mapping.items():
+                if isinstance(record, dict):
+                    identity = record.get("identity")
+                    if not isinstance(identity, list) or len(identity) != 2 or not all(isinstance(value, int) for value in identity):
+                        raise ValueError("历史记录中的文件身份无效")
+                    names = (new_name, record.get("old"), record.get("source"))
+                else:
+                    names = (new_name, record)
+                for name in names:
+                    if not isinstance(name, str) or not name or name in {".", ".."} or any(ch in name for ch in '\\/:\x00'):
+                        raise ValueError("历史记录中的文件名无效")
+        return data
+
     def _save_history_db(self):
+        temporary = None
         try:
+            if getattr(self, "_history_read_error", None):
+                raise ValueError("原历史记录无法读取，已保留；请修复后重新打开工具箱。")
+            current = AppConfig.HISTORY_FILE.read_bytes() if AppConfig.HISTORY_FILE.exists() else None
+            if current is not None:
+                self._validate_history(json.loads(current.decode("utf-8-sig")))
+            if hasattr(self, "_history_loaded_bytes") and current != self._history_loaded_bytes:
+                raise ValueError("历史记录已被其他程序修改，请重新打开后重试。")
+            self._validate_history(self.history_db)
             AppConfig.BASE_DIR.mkdir(parents=True, exist_ok=True)
-            with open(AppConfig.TMP_HISTORY, "w", encoding="utf-8") as file:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=AppConfig.BASE_DIR,
+                                             prefix=".subtitle_history_", suffix=".tmp", delete=False) as file:
+                temporary = Path(file.name)
                 json.dump(self.history_db, file, ensure_ascii=False, indent=2)
-            os.replace(AppConfig.TMP_HISTORY, AppConfig.HISTORY_FILE)
+                file.flush()
+                os.fsync(file.fileno())
+            saved = temporary.read_bytes()
+            os.replace(temporary, AppConfig.HISTORY_FILE)
+            self._history_loaded_bytes = saved
+            return True
         except Exception as exc:
             self.safe_log(f"历史记录保存失败：{exc}", "err")
+            return False
+        finally:
+            if temporary is not None and temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError as exc:
+                    self.safe_log(f"历史临时文件清理失败：{exc}", "err")
 
     def _load_history_db(self):
+        self._history_read_error = None
+        self._history_loaded_bytes = None
         if not AppConfig.HISTORY_FILE.exists():
             return
         try:
-            with open(AppConfig.HISTORY_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-            if isinstance(data, dict):
-                self.history_db = data
-        except Exception:
+            self._history_loaded_bytes = AppConfig.HISTORY_FILE.read_bytes()
+            self.history_db = self._validate_history(json.loads(self._history_loaded_bytes.decode("utf-8-sig")))
+        except Exception as exc:
             self.history_db = {}
+            self._history_read_error = str(exc)
+            self.safe_log(f"历史记录读取失败，原文件已保留：{exc}", "err")
 
     def undo(self):
-        if not self.target_dir:
+        if self.is_running or not self.target_dir:
+            return
+        if not self._save_history_db():
             return
 
         folder_key = self.target_dir.as_posix()
@@ -866,17 +984,42 @@ class MainApp:
         count = 0
         undone_keys: List[str] = []
 
-        for new_name, old_name in reversed(list(mapping.items())):
+        for new_name, record in reversed(list(mapping.items())):
             new_path = self.target_dir / new_name
+            old_name = record["old"] if isinstance(record, dict) else record
             old_path = self.target_dir / old_name
+            if isinstance(record, dict):
+                # A write-ahead entry may survive a failed rename/rollback.
+                # Follow the original file identity, never a replacement at its name.
+                matched_path = None
+                for candidate in (new_path, self.target_dir / record["source"]):
+                    try:
+                        identity = candidate.stat()
+                    except OSError:
+                        continue
+                    if [identity.st_dev, identity.st_ino] == record["identity"]:
+                        matched_path = candidate
+                        break
+                if matched_path is None:
+                    self.safe_log(f"撤销未完成：原文件身份无法确认，已保留记录 -> {new_name}", "warn")
+                    continue
+                new_path = matched_path
             if not new_path.exists():
+                self.safe_log(f"撤销未完成：文件暂不可用，已保留记录供重试 -> {new_name}", "warn")
+                continue
+            if new_path == old_path:
                 undone_keys.append(new_name)
                 continue
             if old_path.exists():
-                old_path = old_path.with_name(f"{old_path.stem}_recovered{old_path.suffix}")
+                original_path = old_path
+                old_path = original_path.with_name(f"{original_path.stem}_recovered{original_path.suffix}")
+                counter = 2
+                while old_path.exists():
+                    old_path = original_path.with_name(f"{original_path.stem}_recovered_{counter}{original_path.suffix}")
+                    counter += 1
 
             try:
-                shutil.move(str(new_path), str(old_path))
+                new_path.rename(old_path)
                 undone_keys.append(new_name)
                 count += 1
             except PermissionError:
@@ -890,7 +1033,8 @@ class MainApp:
             self.history_db.pop(folder_key, None)
 
         self._save_history_db()
-        self.safe_log(f"撤销完成：恢复 {count} 个文件。", "success")
+        pending = len(mapping)
+        self.safe_log(f"撤销结果：恢复 {count} 个文件，{pending} 条未完成记录已保留。", "warn" if pending else "success")
         if self.history_db.get(folder_key):
             self.safe_ui(self.btn_undo, state=tk.NORMAL)
 

@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 def compress_video(source: Path, destination: Path) -> tuple[bool, str]:
+    if destination.exists():
+        return False, f"Destination already exists: {destination}"
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return False, "ffmpeg not found in PATH"
@@ -13,7 +15,7 @@ def compress_video(source: Path, destination: Path) -> tuple[bool, str]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         ffmpeg,
-        "-y",
+        "-n",
         "-i",
         str(source),
         "-c:v",

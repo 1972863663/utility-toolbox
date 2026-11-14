@@ -9,11 +9,18 @@ from .utils import safe_segment, sha256_file
 
 
 def scan_media(config: AppConfig) -> ScanManifest:
-    source = Path(config.source_dir)
-    output = Path(config.output_dir)
+    source = Path(config.source_dir).resolve()
+    output = Path(config.output_dir).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"源目录不存在或不是文件夹：{source}")
+    if source == output:
+        raise ValueError("输出目录不能与源目录相同")
+    output_inside_source = output.is_relative_to(source)
     items: list[MediaItem] = []
 
     for path in sorted(source.rglob("*")):
+        if output_inside_source and path.resolve().is_relative_to(output):
+            continue
         if not path.is_file():
             continue
         ext = path.suffix.lower()

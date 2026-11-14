@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Callable
@@ -29,13 +30,13 @@ def execute_plan(manifest: ScanManifest, progress: ProgressCallback | None = Non
         try:
             _emit(progress, f"[{index}/{len(manifest.items)}] Copying {source.name}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            _copy_without_overwrite(source, target)
             item.target_path = str(target)
             item.status = "copied"
             log["copied"].append({"source": str(source), "target": str(target)})
 
             if item.media_type == "video":
-                compressed = target.parent / "Compressed" / f"{target.stem}.mp4"
+                compressed = unique_path(target.parent / "Compressed" / f"{target.stem}.mp4")
                 _emit(progress, f"Compressing {source.name}")
                 ok, message = compress_video(target, compressed)
                 record = {"source": str(target), "target": str(compressed), "message": message}
@@ -62,3 +63,24 @@ def execute_plan(manifest: ScanManifest, progress: ProgressCallback | None = Non
 def _emit(progress: ProgressCallback | None, message: str) -> None:
     if progress:
         progress(message)
+
+
+def _copy_without_overwrite(source: Path, target: Path) -> None:
+    created_identity = None
+    try:
+        with source.open("rb") as source_file, target.open("xb") as target_file:
+            created = os.fstat(target_file.fileno())
+            created_identity = (created.st_dev, created.st_ino)
+            shutil.copyfileobj(source_file, target_file)
+        shutil.copystat(source, target)
+    except Exception as exc:
+        if created_identity is not None:
+            try:
+                current = target.stat(follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == created_identity:
+                    target.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                raise OSError(f"{exc}; incomplete output cleanup failed: {cleanup_error}") from exc
+        raise

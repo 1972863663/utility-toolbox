@@ -20,3 +20,16 @@ Thumbs.db
 /工具箱.exe
 /工具箱_桌面旧版.exe
 /mic_tool_workspace/
+
+# Official portable Game Save Manager (local runtime only)
+/game_save_manager/
+
+# Portable runtime data and temporary maintenance files
+/data/
+/.maintenance/
+.ruff_cache/
+
+# Main executable builds are distributed via GitHub Releases
+/工具箱-毛玻璃版.exe
+/工具箱-Neverlose风格.exe
+desktop.ini

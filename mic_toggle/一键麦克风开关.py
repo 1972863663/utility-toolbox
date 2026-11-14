@@ -14,9 +14,13 @@ from pathlib import Path
 from tkinter import messagebox
 import tkinter as tk
 
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from toolbox_paths import data_directory
+
 
 APP_NAME = "一键麦克风开关"
-CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "MicToggleHotkey"
+CONFIG_DIR = data_directory("MicToggleHotkey")
 CONFIG_PATH = CONFIG_DIR / "config.json"
 DEFAULT_OVERLAY_SCALE = 0.75
 MIN_OVERLAY_SCALE = 0.60
@@ -204,8 +208,11 @@ def load_config() -> dict:
     except Exception:
         pass
     codes = config.get("hotkey_codes")
-    if not isinstance(codes, list) or not all(isinstance(item, int) for item in codes):
-        codes = parse_hotkey_text(str(config.get("hotkey") or DEFAULT_CONFIG["hotkey"]))
+    if not isinstance(codes, list) or not all(type(item) is int and 0 < item < 255 for item in codes):
+        try:
+            codes = parse_hotkey_text(str(config.get("hotkey") or DEFAULT_CONFIG["hotkey"]))
+        except ValueError:
+            codes = list(DEFAULT_CONFIG["hotkey_codes"])
     config["hotkey_codes"] = codes or list(DEFAULT_CONFIG["hotkey_codes"])
     config["hotkey"] = format_hotkey(config["hotkey_codes"])
     if not isinstance(config.get("hotkey_enabled"), bool):
@@ -434,7 +441,9 @@ def parse_hotkey_text(text: str) -> list[int]:
     codes = []
     for part in text.replace(" ", "").split("+"):
         code = reverse.get(part.lower())
-        if code is not None and code not in codes:
+        if code is None:
+            raise ValueError(f"未知热键：{part}")
+        if code not in codes:
             codes.append(code)
     return codes
 
@@ -763,6 +772,9 @@ class MicToggleApp:
         self.config = load_config()
         self.overlay = StatusOverlay(root, self.config["overlay_scale"])
         self.busy = threading.Lock()
+        self._poll_lock = threading.Lock()
+        self._state_version = 0
+        self._stopped = False
         self.hotkey_was_down = False
         self.recording = False
         self.root.title(APP_NAME)
@@ -850,40 +862,101 @@ class MicToggleApp:
         tick()
 
     def on_toggle(self) -> None:
-        if not self.busy.acquire(blocking=False):
+        if self._stopped or not self.busy.acquire(blocking=False):
             return
-        threading.Thread(target=self._toggle_worker, daemon=True).start()
+        self._state_version += 1
+        try:
+            threading.Thread(target=self._toggle_worker, daemon=True).start()
+        except Exception:
+            self.busy.release()
+            raise
 
     def _toggle_worker(self) -> None:
-        try:
-            muted, device_name, _endpoint_id = toggle_mic_status(
-                endpoint_id=self.config.get("target_endpoint_id", "")
+        version = getattr(self, "_state_version", 0)
+        endpoint_id = self.config.get("target_endpoint_id", "")
+
+        def still_current():
+            return (
+                not getattr(self, "_stopped", False)
+                and version == getattr(self, "_state_version", 0)
+                and endpoint_id == self.config.get("target_endpoint_id", "")
             )
-            self.root.after(0, lambda: self.overlay.set_state(muted, device_name))
+
+        try:
+            if not still_current():
+                return
+            muted, device_name, _endpoint_id = toggle_mic_status(
+                endpoint_id=endpoint_id
+            )
+            if still_current():
+                self.root.after(0, lambda: self.overlay.set_state(muted, device_name) if still_current() else None)
         except Exception as exc:
-            self.root.after(0, lambda: messagebox.showerror(APP_NAME, f"切换麦克风失败：{exc}"))
+            if still_current():
+                try:
+                    self.root.after(0, lambda error=str(exc): messagebox.showerror(APP_NAME, f"切换麦克风失败：{error}") if still_current() else None)
+                except (RuntimeError, tk.TclError):
+                    pass
         finally:
             self.busy.release()
 
     def poll_state(self) -> None:
+        if self._stopped:
+            return
         latest_config = load_config()
         if latest_config != self.config:
             self.config = latest_config
+            self._state_version += 1
             self.overlay.set_scale(self.config["overlay_scale"])
             self.refresh_menu()
-        threading.Thread(target=self._poll_worker, daemon=True).start()
+        if not self.busy.locked() and self._poll_lock.acquire(blocking=False):
+            try:
+                threading.Thread(
+                    target=self._poll_worker,
+                    args=(self._state_version, self.config.get("target_endpoint_id", "")),
+                    daemon=True,
+                ).start()
+            except Exception:
+                self._poll_lock.release()
+                self.root.after(1000, self.poll_state)
+                raise
         self.root.after(1000, self.poll_state)
 
-    def _poll_worker(self) -> None:
+    def _poll_worker(self, version: int | None = None, endpoint_id: str | None = None) -> None:
+        owns_poll_slot = version is not None
+        if version is None:
+            version = getattr(self, "_state_version", 0)
+        if endpoint_id is None:
+            endpoint_id = self.config.get("target_endpoint_id", "")
         try:
-            muted, device_name, _endpoint_id = get_mic_status(
-                endpoint_id=self.config.get("target_endpoint_id", "")
-            )
-            self.root.after(0, lambda: self.overlay.set_state(muted, device_name))
-        except Exception:
-            self.root.after(0, self.overlay.set_error)
+            try:
+                result = get_mic_status(endpoint_id=endpoint_id)
+            except Exception:
+                result = None
+
+            def apply_result():
+                if (
+                    getattr(self, "_stopped", False)
+                    or version != getattr(self, "_state_version", 0)
+                    or endpoint_id != self.config.get("target_endpoint_id", "")
+                ):
+                    return
+                if result is None:
+                    self.overlay.set_error()
+                else:
+                    self.overlay.set_state(result[0], result[1])
+
+            if not getattr(self, "_stopped", False):
+                try:
+                    self.root.after(0, apply_result)
+                except (RuntimeError, tk.TclError):
+                    pass
+        finally:
+            if owns_poll_slot:
+                self._poll_lock.release()
 
     def poll_hotkey(self) -> None:
+        if getattr(self, "_stopped", False):
+            return
         codes = self.config.get("hotkey_codes") or []
         enabled = self.config.get("hotkey_enabled", True)
         active = bool(enabled and codes) and all(key_down(code) for code in codes)
@@ -893,6 +966,8 @@ class MicToggleApp:
         self.root.after(35, self.poll_hotkey)
 
     def quit(self) -> None:
+        self._stopped = True
+        self._state_version += 1
         self.root.destroy()
 
 

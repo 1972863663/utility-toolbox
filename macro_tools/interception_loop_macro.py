@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Set
+
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from toolbox_paths import macro_recording_path
 
 import interception
 try:
@@ -34,7 +39,7 @@ except Exception:
     pynput_keyboard = None
 
 
-MACRO_JSON = Path(r"C:\Users\User\Desktop\macro_recording.json")
+MACRO_JSON = macro_recording_path()
 TOGGLE_HOTKEY = "mouse:x1"
 LOOP_INTERVAL_SECONDS = 0.1
 HOTKEY_BACKEND = "pynput"  # 推荐 pynput：侧键识别比 Interception 监听更稳定
@@ -93,6 +98,7 @@ class RuntimeState:
         self.pressed_keys: Set[str] = set()
         self.pressed_mouse_buttons: Set[str] = set()
         self.hotkey_display = hotkey_display
+        self.error = None
 
     def toggle(self) -> None:
         with self.lock:
@@ -139,6 +145,8 @@ def parse_loop_interval(value: Any) -> float:
         interval = float(value)
     except Exception:
         raise ValueError(f"\u5faa\u73af\u95f4\u9694\u5fc5\u987b\u662f\u6570\u5b57\uff0c\u6536\u5230\uff1a{value!r}")
+    if not math.isfinite(interval):
+        raise ValueError("循环间隔必须是有限数字")
     if interval < 0:
         raise ValueError("\u5faa\u73af\u95f4\u9694\u4e0d\u80fd\u5c0f\u4e8e 0")
     if interval > 3600:
@@ -156,20 +164,28 @@ def clean_key_name(key: Any) -> str:
 
 def validate_and_normalize_event(raw: Dict[str, Any], skip_hotkey_buttons: Set[str]) -> Dict[str, Any] | None:
     if not isinstance(raw, dict):
-        return None
+        raise ValueError("宏事件必须是 JSON 对象")
     etype = raw.get("type")
+    if not isinstance(etype, str):
+        raise ValueError("宏事件 type 必须是文本")
     if etype not in SUPPORTED_EVENT_TYPES:
         return None
     data = raw.get("data")
     if not isinstance(data, dict):
-        data = {}
+        raise ValueError("宏事件 data 必须是 JSON 对象")
 
     try:
         t = float(raw.get("t", 0.0))
-    except Exception:
-        t = 0.0
-    if t < 0:
-        t = 0.0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("宏事件时间必须是有限非负数字") from exc
+    if isinstance(raw.get("t"), bool) or not math.isfinite(t) or t < 0:
+        raise ValueError("宏事件时间必须是有限非负数字")
+
+    def integer_field(name: str) -> int:
+        value = data.get(name, 0)
+        if type(value) is not int:
+            raise ValueError(f"宏事件 {name} 必须是整数")
+        return value
 
     if etype == "mouse_click":
         btn = normalize_button_name(data.get("button", "left"))
@@ -178,35 +194,39 @@ def validate_and_normalize_event(raw: Dict[str, Any], skip_hotkey_buttons: Set[s
         if btn not in MOUSE_BUTTON_MAP:
             print(f"[FILTER] 跳过未知鼠标按钮：{btn}", flush=True)
             return None
+        if type(data.get("pressed")) is not bool:
+            raise ValueError("鼠标事件 pressed 必须是 JSON 布尔值 true/false")
         return {
             "t": t,
             "type": etype,
             "data": {
-                "x": int(data.get("x", 0)),
-                "y": int(data.get("y", 0)),
+                "x": integer_field("x"),
+                "y": integer_field("y"),
                 "button": btn,
-                "pressed": bool(data.get("pressed")),
+                "pressed": data["pressed"],
             },
         }
 
     if etype == "mouse_move":
         if "x" not in data or "y" not in data:
             return None
-        return {"t": t, "type": etype, "data": {"x": int(data["x"]), "y": int(data["y"])}}
+        return {"t": t, "type": etype, "data": {"x": integer_field("x"), "y": integer_field("y")}}
 
     if etype == "mouse_scroll":
         return {
             "t": t,
             "type": etype,
             "data": {
-                "x": int(data.get("x", 0)),
-                "y": int(data.get("y", 0)),
-                "dx": int(data.get("dx", 0)),
-                "dy": int(data.get("dy", 0)),
+                "x": integer_field("x"),
+                "y": integer_field("y"),
+                "dx": integer_field("dx"),
+                "dy": integer_field("dy"),
             },
         }
 
     if etype in {"key_press", "key_release"}:
+        if not isinstance(data.get("key"), str):
+            raise ValueError("键盘事件 key 必须是文本")
         key = clean_key_name(data.get("key", ""))
         if not key:
             return None
@@ -218,6 +238,8 @@ def validate_and_normalize_event(raw: Dict[str, Any], skip_hotkey_buttons: Set[s
 def load_macro(path: Path, hotkey_button: str | None, loop_interval: float) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError("宏文件必须是 JSON 对象")
     raw_events = payload.get("events", [])
     skip_hotkey_buttons: Set[str] = set()
     if hotkey_button:
@@ -266,32 +288,35 @@ def load_macro(path: Path, hotkey_button: str | None, loop_interval: float) -> L
     return normalized
 
 
-def interruptible_sleep(seconds: float, state: RuntimeState) -> bool:
-    seconds = max(0.0, min(float(seconds), MAX_EVENT_DELAY_SECONDS))
+def interruptible_sleep(seconds: float, state: RuntimeState, max_seconds: float = MAX_EVENT_DELAY_SECONDS) -> bool:
+    seconds = max(0.0, min(float(seconds), max_seconds))
     end = time.perf_counter() + seconds
     while time.perf_counter() < end:
         if state.quit.is_set() or not state.enabled.is_set():
             return False
-        time.sleep(min(0.005, end - time.perf_counter()))
+        remaining = end - time.perf_counter()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.005, remaining))
     return True
 
 
 def safe_release_all(state: RuntimeState) -> None:
     with state.lock:
-        keys = list(state.pressed_keys)
-        buttons = list(state.pressed_mouse_buttons)
-        state.pressed_keys.clear()
-        state.pressed_mouse_buttons.clear()
-    for key in keys:
-        try:
-            interception.key_up(key, delay=0)
-        except Exception:
-            pass
-    for button in buttons:
-        try:
-            interception.mouse_up(button, delay=0)
-        except Exception:
-            pass
+        for key in tuple(state.pressed_keys):
+            try:
+                interception.key_up(key, delay=0)
+            except Exception as exc:
+                print(f"[RELEASE ERROR] 按键 {key} 释放失败，将重试：{exc}", flush=True)
+            else:
+                state.pressed_keys.discard(key)
+        for button in tuple(state.pressed_mouse_buttons):
+            try:
+                interception.mouse_up(button, delay=0)
+            except Exception as exc:
+                print(f"[RELEASE ERROR] 鼠标 {button} 释放失败，将重试：{exc}", flush=True)
+            else:
+                state.pressed_mouse_buttons.discard(button)
 
 
 def replay_event(event: Dict[str, Any], state: RuntimeState) -> None:
@@ -338,7 +363,7 @@ def replay_event(event: Dict[str, Any], state: RuntimeState) -> None:
         return
 
 
-def playback_worker(events: List[Dict[str, Any]], state: RuntimeState, hotkey_button: str) -> None:
+def playback_worker(events: List[Dict[str, Any]], state: RuntimeState, hotkey_button: str, loop_interval: float = LOOP_INTERVAL_SECONDS) -> None:
     print(f"[READY] 待机中。按 mouse:{hotkey_button} 开始/暂停循环。Ctrl+C 退出。", flush=True)
     while not state.quit.is_set():
         state.enabled.wait(0.05)
@@ -365,12 +390,23 @@ def playback_worker(events: List[Dict[str, Any]], state: RuntimeState, hotkey_bu
         if state.enabled.is_set() and not state.quit.is_set():
             state.loop_count += 1
             print(f"[LOOP] \u7b2c {state.loop_count} \u6b21\u5b8c\u6210\uff0c\u95f4\u9694 {loop_interval:.3f}s", flush=True)
-            interruptible_sleep(loop_interval, state)
+            interruptible_sleep(loop_interval, state, max_seconds=3600)
+
+
+def wait_for_hotkey_listener(state: RuntimeState, listener) -> None:
+    while not state.quit.is_set():
+        if not listener.is_alive():
+            # pynput rethrows callback/backend errors from join().
+            listener.join()
+            raise RuntimeError("热键监听器意外停止")
+        time.sleep(0.05)
 
 
 def pynput_hotkey_listener_worker(state: RuntimeState, hotkey_button: str) -> None:
     if pynput_mouse is None:
-        print("[HOTKEY ERROR] 未安装 pynput：python -m pip install pynput", flush=True)
+        state.error = "未安装 pynput：python -m pip install pynput"
+        print(f"[HOTKEY ERROR] {state.error}", flush=True)
+        state.quit.set()
         return
 
     def on_click(x, y, button, pressed):
@@ -384,29 +420,50 @@ def pynput_hotkey_listener_worker(state: RuntimeState, hotkey_button: str) -> No
         return None
 
     print(f"[HOTKEY] pynput 正在监听 mouse:{hotkey_button}。", flush=True)
-    with pynput_mouse.Listener(on_click=on_click) as listener:
-        while not state.quit.is_set():
-            time.sleep(0.05)
-        listener.stop()
+    listener = None
+    try:
+        listener = pynput_mouse.Listener(on_click=on_click)
+        listener.start()
+        wait_for_hotkey_listener(state, listener)
+    except Exception as exc:
+        state.error = f"鼠标热键监听失败：{exc}"
+        print(f"[HOTKEY ERROR] {state.error}", flush=True)
+        state.quit.set()
+    finally:
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception as exc:
+                state.error = state.error or f"鼠标热键清理失败：{exc}"
+                print(f"[HOTKEY ERROR] {state.error}", flush=True)
+                state.quit.set()
 
 
 
 def keyboard_hotkey_listener_worker(state: RuntimeState, hotkey: str) -> None:
     if pynput_keyboard is None:
-        print("[HOTKEY ERROR] \u672a\u5b89\u88c5 pynput\uff0c\u65e0\u6cd5\u76d1\u542c\u952e\u76d8\u70ed\u952e\uff1apython -m pip install pynput", flush=True)
+        state.error = "未安装 pynput，无法监听键盘热键：python -m pip install pynput"
+        print(f"[HOTKEY ERROR] {state.error}", flush=True)
+        state.quit.set()
         return
+    listener = None
     try:
         listener = pynput_keyboard.GlobalHotKeys({hotkey: state.toggle})
+        listener.start()
+        print(f"[HOTKEY] pynput 正在监听键盘热键 {hotkey}。", flush=True)
+        wait_for_hotkey_listener(state, listener)
     except Exception as exc:
-        print(f"[HOTKEY ERROR] \u952e\u76d8\u70ed\u952e\u683c\u5f0f\u65e0\u6548\uff1a{hotkey} -> {exc}", flush=True)
-        return
-    print(f"[HOTKEY] pynput \u6b63\u5728\u76d1\u542c\u952e\u76d8\u70ed\u952e {hotkey}\u3002", flush=True)
-    listener.start()
-    try:
-        while not state.quit.is_set():
-            time.sleep(0.05)
+        state.error = f"键盘热键监听失败：{hotkey} -> {exc}"
+        print(f"[HOTKEY ERROR] {state.error}", flush=True)
+        state.quit.set()
     finally:
-        listener.stop()
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception as exc:
+                state.error = state.error or f"键盘热键清理失败：{exc}"
+                print(f"[HOTKEY ERROR] {state.error}", flush=True)
+                state.quit.set()
 
 
 def self_check(events: List[Dict[str, Any]]) -> None:
@@ -454,7 +511,11 @@ def main() -> int:
         return 3
 
     hotkey_button_for_filter = hotkey_value if hotkey_kind == "mouse" else None
-    events = load_macro(macro_path, hotkey_button_for_filter, loop_interval)
+    try:
+        events = load_macro(macro_path, hotkey_button_for_filter, loop_interval)
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] 宏文件无效：{exc}", flush=True)
+        return 2
     self_check(events)
 
     print(f"[CONFIG] ???{hotkey_display}", flush=True)
@@ -487,16 +548,17 @@ def main() -> int:
     play_thread.start()
 
     try:
-        while True:
+        while not state.quit.is_set():
             time.sleep(0.25)
     except KeyboardInterrupt:
         print("\n[EXIT] \u6b63\u5728\u9000\u51fa\u2026\u2026", flush=True)
+    finally:
         state.quit.set()
         state.enabled.set()
-        safe_release_all(state)
         hotkey_thread.join(timeout=1.0)
         play_thread.join(timeout=1.0)
-        return 0
+        safe_release_all(state)
+    return 1 if state.error else 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

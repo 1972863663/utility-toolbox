@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import re
@@ -10,7 +11,6 @@ import time
 import uuid
 import webbrowser
 import winreg
-import zipfile
 import ctypes
 from ctypes import wintypes
 from collections import Counter
@@ -30,10 +30,14 @@ except Exception:
 
 import win32api
 import win32con
+import win32event
 import win32gui
 import win32process
 
 from subtitle_sync_embedded import MainApp as SubtitleSyncApp
+from game_save_manager_launcher import GameSaveManagerTab
+from toolbox_paths import data_directory, macro_recording_path
+from toolbox_ui import THEME, DarkScrolledText, ToolboxShell, setup_theme
 
 try:
     from media_organizer.models import AppConfig, ScanManifest
@@ -50,17 +54,22 @@ except Exception:
 
 
 APP_NAME = "Windows 实用工具箱"
-APP_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "UtilityToolbox"
+APP_DIR = data_directory("UtilityToolbox")
 CONFIG_FILE = APP_DIR / "config.json"
 LOG_FILE = APP_DIR / "toolbox.log"
-DEFAULT_BACKUP_DIR = Path.home() / "Documents" / "SaveBackups"
 AUTOSTART_ARG = "--minimized-to-tray"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "UtilityToolbox"
 APP_ICON_FILE = "utility_toolbox.ico"
 LAUNCHER_CLOSE_EXTENSIONS = {".exe", ".bat", ".cmd", ".py", ".ps1", ".lnk"}
 PROCESS_EXECUTABLE_EXTENSIONS = {".exe"}
-DIRECTORY_SCOPE_KEYWORDS = ("launcher", "runner", "start", "auto", "启动器", "启动")
+PROCESS_SCRIPT_EXTENSIONS = {".bat", ".cmd", ".py", ".ps1"}
+DIRECTORY_SCOPE_KEYWORDS = ("launcher", "runner", "启动器")
+PROCESS_CLOSE_TIMEOUT_SECONDS = 10
+PROCESS_EXIT_WAIT_SECONDS = 2
+PROCESS_CLOSE_OBSERVATION_SECONDS = 2.0
+PROCESS_CLOSE_OBSERVATION_INTERVAL_SECONDS = 0.2
+SCRIPT_HOST_NAMES = {"cmd.exe", "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe", "py.exe", "wscript.exe", "cscript.exe"}
 LAUNCHER_REPAIR_IGNORE_DIRS = {
     "$recycle.bin",
     "$windows.~bt",
@@ -81,20 +90,6 @@ LAUNCHER_REPAIR_IGNORE_DIRS = {
     "windows",
 }
 LAUNCHER_REPAIR_MAX_SECONDS = 25
-
-THEME = {
-    "bg": "#f5f7fb",
-    "panel": "#ffffff",
-    "panel_alt": "#eef3f8",
-    "border": "#d7e0ea",
-    "text": "#1f2937",
-    "muted": "#64748b",
-    "accent": "#2563eb",
-    "accent_hover": "#1d4ed8",
-    "success": "#0f766e",
-    "danger": "#dc2626",
-    "selection": "#dbeafe",
-}
 
 
 def configure_dpi_awareness() -> None:
@@ -178,13 +173,14 @@ def parent_process_id(pid: Optional[int] = None) -> Optional[int]:
 def current_process_protected_pids() -> Set[int]:
     protected = {os.getpid()}
     parent_pid = parent_process_id()
-    if parent_pid:
+    while parent_pid and parent_pid not in protected and len(protected) < 128:
         protected.add(parent_pid)
+        parent_pid = parent_process_id(parent_pid)
     return protected
 
 
-def is_current_process(pid: int, process_path: str) -> bool:
-    if pid in current_process_protected_pids():
+def is_current_process(pid: int, process_path: str, protected_pids: Optional[Set[int]] = None) -> bool:
+    if pid in (current_process_protected_pids() if protected_pids is None else protected_pids):
         return True
     current_path = normalize_process_path(current_executable_path())
     process_normalized = normalize_process_path(process_path)
@@ -219,13 +215,32 @@ def is_process_in_target_scope(process_path: str, target_path: str) -> bool:
 def resolve_shortcut_target(path: str) -> str:
     if Path(path).suffix.lower() != ".lnk" or os.name != "nt":
         return path
+    import pythoncom
+
+    initialized = False
+    shell = shortcut = None
     try:
+        try:
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+            initialized = True
+        except pythoncom.com_error as exc:
+            # An existing MTA is already initialized and must not be uninitialized here.
+            if exc.hresult != -2147417850:  # RPC_E_CHANGED_MODE
+                raise
         shell = win32com_client_dispatch("WScript.Shell")
         shortcut = shell.CreateShortcut(path)
         target = getattr(shortcut, "TargetPath", "")
-        return target or path
-    except Exception:
-        return path
+        if not target:
+            raise RuntimeError("快捷方式没有可用目标")
+        if Path(target).name.casefold() in SCRIPT_HOST_NAMES and getattr(shortcut, "Arguments", "").strip():
+            raise RuntimeError("暂不支持关闭带参数的脚本宿主快捷方式，以免关闭其他终端或脚本")
+        return target
+    except Exception as exc:
+        raise RuntimeError(f"无法解析快捷方式 {Path(path).name}：{exc}") from exc
+    finally:
+        shortcut = shell = None
+        if initialized:
+            pythoncom.CoUninitialize()
 
 
 def win32com_client_dispatch(prog_id: str):
@@ -244,6 +259,26 @@ def path_looks_like_directory(path: str) -> bool:
     return candidate.suffix == ""
 
 
+def resolve_process_close_target(path: str) -> str:
+    target = resolve_shortcut_target(path)
+    if not path_looks_like_directory(target) and Path(target).suffix.lower() in PROCESS_SCRIPT_EXTENSIONS:
+        raise RuntimeError(f"暂不支持按脚本路径关闭进程：{Path(target).name}；请使用应用 EXE 或应用专用文件夹")
+    return target
+
+
+def resolve_process_close_targets(paths: Iterable[str]) -> Tuple[List[str], List[str]]:
+    targets: List[str] = []
+    errors: List[str] = []
+    for path in paths:
+        if not path:
+            continue
+        try:
+            targets.append(resolve_process_close_target(str(path)))
+        except Exception as exc:
+            errors.append(f"{Path(str(path)).name}：{exc}")
+    return targets, errors
+
+
 def is_process_in_directory(process_path: str, directory_path: str) -> bool:
     if Path(process_path).suffix.lower() not in PROCESS_EXECUTABLE_EXTENSIONS:
         return False
@@ -255,25 +290,29 @@ def is_process_in_directory(process_path: str, directory_path: str) -> bool:
 
 
 def match_processes_for_drop_paths(paths: Iterable[str], processes: Iterable[Tuple[int, str]]) -> List[Tuple[int, str]]:
+    processes = list(processes)
     file_targets: List[str] = []
     directory_targets: List[str] = []
     for path in paths:
         if not path:
             continue
-        resolved = resolve_shortcut_target(str(path))
+        resolved = resolve_process_close_target(str(path))
         if path_looks_like_directory(resolved):
             directory_targets.append(resolved)
         else:
             file_targets.append(resolved)
 
-    matches = match_processes_for_paths(file_targets, processes)
+    protected = current_process_protected_pids()
+    matches = match_processes_for_paths(file_targets, processes, include_directory_scope=False, protected_pids=protected)
+    if not directory_targets:
+        return matches
     seen_pids = {pid for pid, _process_path in matches}
     own_path = normalize_process_path(app_executable())
     for pid, process_path in processes:
         if pid in seen_pids:
             continue
         normalized = normalize_process_path(process_path)
-        if not normalized or normalized == own_path or is_current_process(pid, process_path):
+        if not normalized or normalized == own_path or is_current_process(pid, process_path, protected):
             continue
         if any(is_process_in_directory(process_path, directory) for directory in directory_targets):
             matches.append((pid, process_path))
@@ -281,19 +320,77 @@ def match_processes_for_drop_paths(paths: Iterable[str], processes: Iterable[Tup
     return matches
 
 
-def match_processes_for_paths(paths: Iterable[str], processes: Iterable[Tuple[int, str]]) -> List[Tuple[int, str]]:
+def match_processes_for_paths(
+    paths: Iterable[str], processes: Iterable[Tuple[int, str]], include_directory_scope: bool = True,
+    protected_pids: Optional[Set[int]] = None,
+) -> List[Tuple[int, str]]:
     targets = [path for path in paths if path]
+    if not targets:
+        return []
+    protected = current_process_protected_pids() if protected_pids is None else protected_pids
     matches: List[Tuple[int, str]] = []
     seen_pids: Set[int] = set()
     for pid, process_path in processes:
         if pid in seen_pids:
             continue
-        if normalize_process_path(process_path) == normalize_process_path(app_executable()) or is_current_process(pid, process_path):
+        if normalize_process_path(process_path) == normalize_process_path(app_executable()) or is_current_process(pid, process_path, protected):
             continue
-        if any(is_process_in_target_scope(process_path, target) for target in targets):
+        if any(
+            is_process_in_target_scope(process_path, target)
+            if include_directory_scope else normalize_process_path(process_path) == normalize_process_path(target)
+            for target in targets
+        ):
             matches.append((pid, process_path))
             seen_pids.add(pid)
     return matches
+
+
+def is_shared_process_directory(path: str) -> bool:
+    directory = Path(path)
+    if directory.anchor and normalize_process_path(str(directory)) == normalize_process_path(directory.anchor):
+        return True
+    user_directory = Path.home()
+    shared = {user_directory, user_directory.parent}
+    shared.update(user_directory / name for name in ("Desktop", "Documents", "Downloads"))
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData", "PUBLIC", "SystemRoot"):
+        value = os.environ.get(variable)
+        if value:
+            shared.add(Path(value))
+    windows = os.environ.get("SystemRoot")
+    if windows:
+        shared.update(Path(windows) / name for name in ("System32", "SysWOW64"))
+    public = os.environ.get("PUBLIC")
+    if public:
+        shared.add(Path(public) / "Desktop")
+    normalized = normalize_process_path(path)
+    return any(normalized == normalize_process_path(str(candidate)) for candidate in shared)
+
+
+def launcher_close_paths(apps: Iterable[Dict[str, str]]) -> List[str]:
+    paths: List[str] = []
+    for app in apps:
+        original = app.get("path", "")
+        if not original:
+            continue
+        try:
+            target = resolve_shortcut_target(original)
+        except Exception:
+            # Keep this target for per-item error reporting in the close worker.
+            paths.append(original)
+            continue
+        paths.append(target)
+        if not any(keyword in Path(target).stem.casefold() for keyword in DIRECTORY_SCOPE_KEYWORDS):
+            continue
+        learned = app.get("close_paths", [])
+        if isinstance(learned, list):
+            parent = str(Path(target).parent)
+            if is_shared_process_directory(parent):
+                continue
+            paths.extend(
+                path for path in learned
+                if isinstance(path, str) and is_process_in_directory(path, parent)
+            )
+    return paths
 
 
 def discover_new_process_paths(before: Iterable[Tuple[int, str]], after: Iterable[Tuple[int, str]]) -> List[str]:
@@ -311,17 +408,56 @@ def discover_new_process_paths(before: Iterable[Tuple[int, str]], after: Iterabl
     return discovered
 
 
+class ProcessSnapshot(list):
+    """Compatible process list that preserves incomplete-enumeration evidence."""
+
+    def __init__(self):
+        super().__init__()
+        self.unreadable: Dict[int, str] = {}
+
+
+def process_snapshot_notice(processes: Iterable[Tuple[int, str]]) -> str:
+    unreadable = getattr(processes, "unreadable", {})
+    if unreadable:
+        return f"；另有 {len(unreadable)} 个进程无法查询（权限或进程状态变化），扫描结果不完整"
+    return ""
+
+
+def start_process_close_worker(controller, work: Callable[[], None]) -> None:
+    if getattr(controller, "_close_stopped", False):
+        return
+    lock = getattr(controller, "_close_lock", None)
+    if lock is None:
+        lock = controller._close_lock = threading.Lock()
+    if not lock.acquire(blocking=False):
+        return
+
+    def run() -> None:
+        try:
+            if not getattr(controller, "_close_stopped", False):
+                work()
+        finally:
+            lock.release()
+
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:
+        lock.release()
+        raise
+
+
 def running_process_paths() -> List[Tuple[int, str]]:
-    processes: List[Tuple[int, str]] = []
+    processes = ProcessSnapshot()
     for pid in win32process.EnumProcesses():
         handle = None
         try:
             handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            path = win32process.GetModuleFileNameEx(handle, 0)
+            path = _process_path_from_handle(handle)
             if path:
                 processes.append((pid, path))
-        except Exception:
-            pass
+        except Exception as exc:
+            if pid and getattr(exc, "winerror", None) != 87:
+                processes.unreadable[pid] = str(exc)
         finally:
             if handle:
                 try:
@@ -331,26 +467,116 @@ def running_process_paths() -> List[Tuple[int, str]]:
     return processes
 
 
+def observe_closed_process_targets(
+    paths: Iterable[str], include_directories: bool = False, should_stop: Optional[Callable[[], bool]] = None
+) -> Tuple[List[Tuple[int, str]], str, bool]:
+    """Observe a bounded restart window without sending further close requests."""
+    stopped = should_stop or (lambda: False)
+    if stopped():
+        return [], "", True
+    file_targets: Set[str] = set()
+    directory_targets: List[str] = []
+    for path in paths:
+        normalized = normalize_process_path(path)
+        if include_directories and path_looks_like_directory(path):
+            directory_targets.append(normalized.rstrip("\\/") + os.sep.casefold())
+        else:
+            file_targets.add(normalized)
+    protected = current_process_protected_pids()
+    own_path = normalize_process_path(current_executable_path())
+    own_name = Path(current_executable_path()).name.casefold()
+    incomplete = ProcessSnapshot()
+    deadline = time.monotonic() + PROCESS_CLOSE_OBSERVATION_SECONDS
+    first_snapshot = True
+    while True:
+        if stopped():
+            return [], process_snapshot_notice(incomplete), True
+        if not first_snapshot and time.monotonic() >= deadline:
+            return [], process_snapshot_notice(incomplete), False
+        first_snapshot = False
+        snapshot = running_process_paths()
+        incomplete.unreadable.update(getattr(snapshot, "unreadable", {}))
+        remaining: List[Tuple[int, str]] = []
+        for pid, process_path in snapshot:
+            if stopped():
+                return [], process_snapshot_notice(incomplete), True
+            if pid in protected or Path(process_path).name.casefold() == own_name:
+                continue
+            normalized = normalize_process_path(process_path)
+            if not normalized or normalized == own_path:
+                continue
+            exact_match = normalized in file_targets
+            directory_match = Path(process_path).suffix.lower() in PROCESS_EXECUTABLE_EXTENSIONS and any(
+                normalized.startswith(directory) for directory in directory_targets
+            )
+            if exact_match or directory_match:
+                remaining.append((pid, process_path))
+        if remaining:
+            return remaining, process_snapshot_notice(incomplete), False
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            return [], process_snapshot_notice(incomplete), False
+        time.sleep(min(PROCESS_CLOSE_OBSERVATION_INTERVAL_SECONDS, budget))
+
+
+def _process_path_from_handle(handle) -> str:
+    """Query the image path using only PROCESS_QUERY_LIMITED_INFORMATION rights."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel32.QueryFullProcessImageNameW
+    query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = wintypes.DWORD(len(buffer))
+    if not query(int(handle), 0, buffer, ctypes.byref(length)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.value
+
+
+def _open_process_for_close(pid: int, expected_path: Optional[str] = None):
+    try:
+        handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE, False, pid)
+    except Exception as exc:
+        if getattr(exc, "winerror", None) == 87:  # ERROR_INVALID_PARAMETER: PID no longer exists.
+            return None
+        raise
+    try:
+        if expected_path and normalize_process_path(_process_path_from_handle(handle)) != normalize_process_path(expected_path):
+            raise RuntimeError("PID 已由其他路径的进程占用，已跳过")
+        return handle
+    except Exception:
+        win32api.CloseHandle(handle)
+        raise
+
+
+def _wait_for_process_exit(handle, timeout_ms: int = 0) -> bool:
+    result = win32event.WaitForSingleObject(handle, max(0, timeout_ms))
+    if result == win32event.WAIT_OBJECT_0:
+        return True
+    if result == win32event.WAIT_TIMEOUT:
+        return False
+    raise RuntimeError(f"无法确认进程退出状态（WaitForSingleObject={result}）")
+
+
 def is_taskkill_already_closed(message: str) -> bool:
     normalized = message.casefold()
     return "没有找到进程" in normalized or "not found" in normalized
 
 
 def terminate_process(pid: int) -> None:
-    completed = subprocess.run(
-        ["taskkill", "/PID", str(pid), "/T", "/F"],
-        capture_output=True,
-        text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()
-        if is_taskkill_already_closed(detail):
-            return
-        raise RuntimeError(detail or f"taskkill failed with exit code {completed.returncode}")
+    _closed, failures = terminate_processes_fast([pid], include_children=True)
+    if failures:
+        raise RuntimeError(failures[pid])
 
 
-def terminate_processes_fast(pids: Iterable[int]) -> Tuple[Set[int], Dict[int, str]]:
+def terminate_process_only(pid: int) -> None:
+    _closed, failures = terminate_processes_fast([pid], include_children=False)
+    if failures:
+        raise RuntimeError(failures[pid])
+
+
+def terminate_processes_fast(
+    pids: Iterable[int], include_children: bool = True, expected_paths: Optional[Dict[int, str]] = None
+) -> Tuple[Set[int], Dict[int, str]]:
     unique_pids: List[int] = []
     seen: Set[int] = set()
     for pid in pids:
@@ -360,27 +586,80 @@ def terminate_processes_fast(pids: Iterable[int]) -> Tuple[Set[int], Dict[int, s
     if not unique_pids:
         return set(), {}
 
-    args = ["taskkill", "/T", "/F"]
-    for pid in unique_pids:
-        args.extend(["/PID", str(pid)])
-    completed = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
-    output = "\n".join(part for part in [completed.stdout, completed.stderr] if part).strip()
-    if completed.returncode == 0 or is_taskkill_already_closed(output):
-        return set(unique_pids), {}
-
     closed: Set[int] = set()
     failures: Dict[int, str] = {}
-    for pid in unique_pids:
-        try:
-            terminate_process(pid)
-            closed.add(pid)
-        except Exception as exc:
-            failures[pid] = str(exc)
+    handles = {}
+    command_errors: Dict[int, str] = {}
+
+    def run_taskkill(target_pids: Iterable[int], timeout: float):
+        args = ["taskkill", "/F"]
+        if include_children:
+            args.append("/T")
+        for target_pid in target_pids:
+            args.extend(["/PID", str(target_pid)])
+        return subprocess.run(
+            args, capture_output=True, text=True, errors="replace", timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+    def output_error(completed) -> str:
+        detail = "\n".join(part for part in [completed.stdout, completed.stderr] if part).strip()
+        return detail or f"taskkill failed with exit code {completed.returncode}"
+
+    try:
+        for pid in unique_pids:
+            try:
+                handle = _open_process_for_close(pid, (expected_paths or {}).get(pid))
+                if handle is None:
+                    closed.add(pid)
+                    continue
+                handles[pid] = handle
+                if _wait_for_process_exit(handle):
+                    closed.add(pid)
+            except Exception as exc:
+                failures[pid] = f"无法安全核对进程：{exc}"
+
+        active = [pid for pid in handles if pid not in closed and pid not in failures]
+        if active:
+            command_deadline = time.monotonic() + PROCESS_CLOSE_TIMEOUT_SECONDS
+            try:
+                completed = run_taskkill(active, PROCESS_CLOSE_TIMEOUT_SECONDS)
+            except Exception as exc:
+                command_errors.update((pid, str(exc)) for pid in active)
+            else:
+                if completed.returncode != 0:
+                    for pid in active:
+                        try:
+                            if _wait_for_process_exit(handles[pid]):
+                                closed.add(pid)
+                                continue
+                            remaining = command_deadline - time.monotonic()
+                            if remaining <= 0:
+                                command_errors[pid] = "taskkill timeout：批量关闭重试已超时"
+                                continue
+                            retry = run_taskkill([pid], remaining)
+                            if retry.returncode != 0:
+                                command_errors[pid] = output_error(retry)
+                        except Exception as exc:
+                            command_errors[pid] = str(exc)
+
+            exit_deadline = time.monotonic() + PROCESS_EXIT_WAIT_SECONDS
+            for pid in active:
+                if pid in closed:
+                    continue
+                try:
+                    remaining_ms = max(0, int((exit_deadline - time.monotonic()) * 1000))
+                    if _wait_for_process_exit(handles[pid], remaining_ms):
+                        closed.add(pid)
+                    else:
+                        detail = command_errors.get(pid, "关闭请求已发送，但进程仍在运行")
+                        failures[pid] = detail
+                except Exception as exc:
+                    failures[pid] = f"无法确认进程是否已关闭：{exc}"
+    finally:
+        # Retained handles identify the original process even if its PID is reused.
+        for handle in handles.values():
+            win32api.CloseHandle(handle)
     return closed, failures
 
 
@@ -388,7 +667,7 @@ MIC_TOGGLE_PROCESS_NAMES = {
     "一键麦克风开关.exe",
     "Ò»¼üÂó¿Ë·ç¿ª¹Ø.exe",
 }
-MIC_TOGGLE_CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "MicToggleHotkey" / "config.json"
+MIC_TOGGLE_CONFIG_PATH = data_directory("MicToggleHotkey") / "config.json"
 MIC_OVERLAY_DEFAULT_SCALE = 0.75
 MIC_OVERLAY_MIN_SCALE = 0.60
 MIC_OVERLAY_MAX_SCALE = 1.20
@@ -751,6 +1030,29 @@ def repair_autostart_path() -> bool:
     saved_command = read_autostart_command()
     if saved_command is None or autostart_command_matches(saved_command, autostart_command()):
         return False
+    try:
+        arguments = win32api.CommandLineToArgv(saved_command)
+        if not arguments:
+            return False
+        previous_executable = Path(os.path.expandvars(arguments[0]))
+        if not previous_executable.is_absolute():
+            return False
+        previous_target = previous_executable
+        if previous_executable.name.casefold() in {"python.exe", "pythonw.exe"}:
+            # Accept only the source command emitted by app_executable/autostart_command.
+            if len(arguments) != 3 or arguments[2] != AUTOSTART_ARG:
+                return False
+            previous_script = Path(arguments[1])
+            if not previous_script.is_absolute() or previous_script.name.casefold() != "utility_toolbox.py":
+                return False
+            previous_target = previous_script
+        previous_target.stat()
+    except FileNotFoundError:
+        pass  # Only an absent old application target is eligible for automatic relocation.
+    except (OSError, ValueError):
+        return False
+    else:
+        return False  # Another valid copy still owns this explicitly configured startup entry.
     set_autostart(True)
     return True
 
@@ -779,6 +1081,13 @@ def load_config() -> Dict:
 
 def save_config(config: Dict) -> None:
     ensure_app_dir()
+    if CONFIG_FILE.exists():
+        try:
+            existing = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise ValueError("原配置文件无法解析，已保留原文件；请备份并修复后重试。") from exc
+        if not isinstance(existing, dict):
+            raise ValueError("原配置文件必须是 JSON 对象，已保留原文件；请备份并修复后重试。")
     tmp = CONFIG_FILE.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
@@ -893,13 +1202,57 @@ class DateRenamerTab:
             else:
                 stem = source.stem
 
-            if stem == source.stem:
-                target = source
+            name = f"{stem}{source.suffix}"
+            if re.search(r'[<>:"/\\|?*\x00-\x1f]', name) or name.endswith((".", " ")):
+                status = "非法文件名，已跳过"
+                self.plan.append((source, source, status))
+                self.tree.insert("", tk.END, values=(source.name, name, status))
+                continue
+            if stem.lower() == source.stem.lower():
+                target = source.with_name(name)
             else:
                 target = self.unique_target(self.folder, stem, source.suffix, used)
             status = "无需改名" if source.name == target.name else "待改名"
             self.plan.append((source, target, status))
             self.tree.insert("", tk.END, values=(source.name, target.name, status))
+
+    @staticmethod
+    def _validate_undo_payload(payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise ValueError("撤回记录必须包含文件列表")
+        for item in payload["items"]:
+            if not isinstance(item, dict):
+                raise ValueError("撤回记录包含无效条目")
+            for key in ("old", "new"):
+                value = item.get(key)
+                if not isinstance(value, str) or not value or "\x00" in value or not Path(value).is_absolute():
+                    raise ValueError("撤回记录中的文件路径无效")
+            if "identity" in item:
+                identity = item["identity"]
+                if not isinstance(identity, list) or len(identity) != 2 or not all(isinstance(value, int) for value in identity):
+                    raise ValueError("撤回记录中的文件身份无效")
+        return payload
+
+    def _write_undo_payload(self, payload, destination=None) -> None:
+        import tempfile
+
+        destination = destination or self.undo_file
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=destination.parent,
+                                             prefix=".renamer_", suffix=".tmp", delete=False) as handle:
+                temporary = Path(handle.name)
+                if isinstance(payload, bytes):
+                    handle.write(payload.decode("utf-8"))
+                else:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
 
     def apply(self) -> None:
         if not self.plan:
@@ -907,21 +1260,53 @@ class DateRenamerTab:
             return
         if not messagebox.askokcancel("确认", "将按预览结果重命名当前文件夹中的文件，确认执行吗？"):
             return
+        candidates = [(source, target) for source, target, status in self.plan if status == "待改名" and source.exists()]
+        if not candidates:
+            return
+        previous_backup = None
+        try:
+            previous = self.undo_file.read_bytes() if self.undo_file.exists() else None
+            if previous is not None:
+                self._validate_undo_payload(json.loads(previous.decode("utf-8-sig")))
+            ensure_app_dir()
+            if previous is not None:
+                previous_backup = self.undo_file.with_name(f".renamer_previous_{uuid.uuid4().hex}.json")
+                self._write_undo_payload(previous, previous_backup)
+            records = []
+            for source, target in candidates:
+                identity = source.stat()
+                records.append({"old": str(source), "new": str(target), "identity": [identity.st_dev, identity.st_ino]})
+            prepared = {"created_at": datetime.now().isoformat(), "items": records}
+            self._write_undo_payload(prepared)
+        except (OSError, ValueError, TypeError) as exc:
+            if previous_backup is not None and previous_backup.exists():
+                previous_backup.unlink()
+            messagebox.showerror("重命名未执行", f"无法安全保存撤回记录，源文件未改动：{exc}")
+            return
         changed = 0
         undo_items = []
-        for source, target, status in self.plan:
-            if status == "无需改名" or not source.exists():
-                continue
+        for (source, target), record in zip(candidates, records):
             try:
                 source.rename(target)
-                undo_items.append({"old": str(source), "new": str(target)})
+                undo_items.append(record)
                 changed += 1
             except OSError as exc:
                 log_line(f"批量重命名失败: {source} -> {target}: {exc}")
-        if undo_items:
-            ensure_app_dir()
-            with self.undo_file.open("w", encoding="utf-8") as handle:
-                json.dump({"created_at": datetime.now().isoformat(), "items": undo_items}, handle, ensure_ascii=False, indent=2)
+        try:
+            if not undo_items:
+                if previous_backup is not None:
+                    os.replace(previous_backup, self.undo_file)
+                else:
+                    self.undo_file.unlink()
+            elif len(undo_items) != len(candidates):
+                self._write_undo_payload({**prepared, "items": undo_items})
+            if previous_backup is not None and previous_backup.exists():
+                previous_backup.unlink()
+        except OSError as exc:
+            self.preview()
+            recovery = f"；上一轮记录备份：{previous_backup}" if previous_backup is not None and previous_backup.exists() else ""
+            messagebox.showerror("撤回记录更新失败", f"已重命名 {changed} 个文件，预记录已保留：{exc}{recovery}")
+            return
         log_line(f"批量重命名完成: {changed} 个文件")
         self.preview()
         messagebox.showinfo("完成", f"已重命名 {changed} 个文件。")
@@ -933,7 +1318,7 @@ class DateRenamerTab:
         try:
             with self.undo_file.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            items = payload.get("items", [])
+            items = self._validate_undo_payload(payload)["items"]
         except Exception as exc:
             messagebox.showerror("撤回失败", f"读取撤回记录失败：{exc}")
             return
@@ -944,26 +1329,50 @@ class DateRenamerTab:
             return
 
         restored = 0
+        pending = []
         for item in reversed(items):
             new_path = Path(item["new"])
             old_path = Path(item["old"])
+            if "identity" in item:
+                def matches_identity(path, expected_identity=item["identity"]):
+                    try:
+                        identity = path.stat()
+                        return [identity.st_dev, identity.st_ino] == expected_identity
+                    except OSError:
+                        return False
+
+                if not matches_identity(new_path):
+                    if matches_identity(old_path):
+                        continue  # A pre-recorded rename never ran, or was already undone.
+                    pending.append(item)
+                    log_line(f"撤回重命名未完成，原文件身份无法确认: {new_path}")
+                    continue
             if not new_path.exists():
+                pending.append(item)
+                log_line(f"撤回重命名未完成，文件不存在: {new_path}")
                 continue
             target = old_path
-            if target.exists():
-                target = old_path.with_name(f"{old_path.stem}_restored{old_path.suffix}")
+            if target.exists() and target != new_path:
+                target = self.unique_target(old_path.parent, f"{old_path.stem}_restored", old_path.suffix, set())
             try:
                 new_path.rename(target)
                 restored += 1
             except OSError as exc:
+                pending.append(item)
                 log_line(f"撤回重命名失败: {new_path} -> {target}: {exc}")
         try:
-            self.undo_file.unlink()
-        except OSError:
-            pass
+            if pending:
+                payload["items"] = list(reversed(pending))
+                self._write_undo_payload(payload)
+            else:
+                self.undo_file.unlink()
+        except OSError as exc:
+            self.preview()
+            messagebox.showerror("撤回记录保存失败", f"已恢复 {restored} 个文件，但撤回记录未能更新：{exc}")
+            return
         log_line(f"撤回批量重命名完成: {restored} 个文件")
         self.preview()
-        messagebox.showinfo("完成", f"已撤回 {restored} 个文件。")
+        messagebox.showinfo("完成", f"已撤回 {restored} 个文件；{len(pending)} 条未完成记录已保留，可稍后重试。")
 
 
 class TopmostController:
@@ -1189,28 +1598,29 @@ class TopmostController:
         if not hwnd or not self.valid_target(hwnd):
             self.status_callback("没有找到可置顶的当前窗口。")
             return
-        self.set_topmost(hwnd, True)
-        self.status_callback(f"已置顶：{self.window_title(hwnd)}")
-        log_line(f"置顶窗口: {self.window_title(hwnd)}")
+        self.pin_window(hwnd)
 
     def unpin_current(self) -> None:
         hwnd = self.last_hwnd
         if not hwnd or not win32gui.IsWindow(hwnd):
             self.status_callback("没有找到可取消置顶的当前窗口。")
             return
-        self.set_topmost(hwnd, False)
-        self.status_callback(f"已取消置顶：{self.window_title(hwnd)}")
-        log_line(f"取消置顶窗口: {self.window_title(hwnd)}")
+        self.unpin_window(hwnd)
 
     def unpin_all(self) -> None:
+        failures = 0
         for hwnd in list(self.tracked):
             try:
-                if win32gui.IsWindow(hwnd):
-                    self.set_topmost(hwnd, False)
+                if not win32gui.IsWindow(hwnd):
+                    self.tracked.discard(hwnd)
+                elif not self.set_topmost(hwnd, False):
+                    failures += 1
             except Exception:
-                pass
-        self.tracked.clear()
-        self.status_callback("已取消所有由本工具设置的置顶窗口。")
+                failures += 1
+        if failures:
+            self.status_callback(f"取消置顶失败：{failures} 个窗口，已保留记录供重试。")
+        else:
+            self.status_callback("已取消所有由本工具设置的置顶窗口。")
 
     def stop(self) -> None:
         self.running = False
@@ -1221,6 +1631,8 @@ class DropCloseController:
     def __init__(self, root: tk.Tk, status_callback: Callable[[str], None]):
         self.root = root
         self.status_callback = status_callback
+        self._close_lock = threading.Lock()
+        self._close_stopped = False
         if os.name == "nt":
             self.enable()
 
@@ -1248,48 +1660,85 @@ class DropCloseController:
         return "break"
 
     def close_paths(self, paths: List[str]) -> None:
-        threading.Thread(target=self._close_worker, args=(paths,), daemon=True).start()
+        if getattr(self, "_close_stopped", False):
+            return
+        selected = list(paths)
+        coordinator = getattr(self, "_close_coordinator", None)
+        if coordinator is not None:
+            coordinator(lambda: self._close_worker(selected))
+        else:
+            start_process_close_worker(self, lambda: self._close_worker(selected))
 
     def _close_worker(self, paths: List[str]) -> None:
+        if getattr(self, "_close_stopped", False):
+            return
         log_line(f"DropCloseController close worker start: {paths}")
-        processes = running_process_paths()
-        log_line(f"DropCloseController process snapshot count: {len(processes)}")
-        matches = match_processes_for_drop_paths(paths, processes)
-        safe_matches = []
-        for pid, process_path in matches:
-            if is_current_process(pid, process_path):
-                log_line(f"DropCloseController skipped protected process: pid={pid} path={process_path}")
-            else:
-                safe_matches.append((pid, process_path))
-        matches = safe_matches
+        targets, input_errors = resolve_process_close_targets(paths)
+        input_error_summary = f"；目标失败 {len(input_errors)} 项；{input_errors[0]}" if input_errors else ""
+        for error in input_errors:
+            log_line(f"拖入关闭目标失败：{error}")
+        try:
+            processes = running_process_paths()
+            snapshot_notice = process_snapshot_notice(processes)
+            log_line(f"DropCloseController process snapshot count: {len(processes)}")
+            matches = match_processes_for_drop_paths(targets, processes)
+        except Exception as exc:
+            message = f"拖入关闭失败：{exc}{input_error_summary}"
+            log_line(message)
+            self.root.after(0, lambda m=message: self.status_callback(m))
+            return
         log_line(f"DropCloseController matched processes: {matches}")
         names = ", ".join(Path(path).name for path in paths[:3])
         if len(paths) > 3:
             names += f" 等 {len(paths)} 项"
         if not matches:
-            message = f"拖入关闭：未找到正在运行的相关进程（{names}）"
+            message = f"拖入关闭：未找到可查询的相关进程（{names}）{input_error_summary}{snapshot_notice}"
             log_line(message)
             self.root.after(0, lambda m=message: self.status_callback(m))
             return
-        closed = 0
-        failures: List[str] = []
-        for pid, process_path in matches:
-            try:
-                log_line(f"DropCloseController taskkill start: pid={pid} path={process_path}")
-                terminate_process(pid)
-                closed += 1
-                log_line(f"拖入强制关闭: pid={pid} path={process_path}")
-            except Exception as exc:
-                failures.append(f"{Path(process_path).name}: {exc}")
-                log_line(f"拖入强制关闭失败: pid={pid} path={process_path} error={exc}")
+        pid_to_path = dict(matches)
+        if getattr(self, "_close_stopped", False):
+            return
+        try:
+            closed, failures = terminate_processes_fast(pid_to_path, include_children=False, expected_paths=pid_to_path)
+        except Exception as exc:
+            message = f"拖入关闭失败：{exc}{input_error_summary}"
+            log_line(message)
+            self.root.after(0, lambda m=message: self.status_callback(m))
+            return
+        if getattr(self, "_close_stopped", False):
+            return
+        for pid in sorted(closed):
+            log_line(f"拖入强制关闭已验证: pid={pid} path={pid_to_path[pid]}")
+        for pid, error in failures.items():
+            log_line(f"拖入强制关闭失败: pid={pid} path={pid_to_path[pid]} error={error}")
         if failures:
-            message = f"拖入关闭完成：已关闭 {closed} 个，失败 {len(failures)} 个"
+            first_error = next(iter(failures.values()))
+            message = f"拖入关闭完成：已关闭 {len(closed)} 个，失败 {len(failures)} 个；{first_error}"
         else:
-            message = f"拖入关闭完成：已强制关闭 {closed} 个进程"
+            message = f"拖入关闭完成：已确认关闭 {len(closed)} 个进程"
+        message += input_error_summary
+        try:
+            remaining, final_notice, cancelled = observe_closed_process_targets(
+                targets, include_directories=True, should_stop=lambda: getattr(self, "_close_stopped", False)
+            )
+            if cancelled:
+                return
+            if remaining:
+                details = "、".join(f"{Path(path).name}（PID {pid}）" for pid, path in remaining)
+                message = f"拖入关闭：观察期内仍有相关进程运行：{details}；{message}"
+                if any(pid in closed or pid not in pid_to_path for pid, _path in remaining):
+                    message += "；可能被重新启动"
+            else:
+                message += f"；{PROCESS_CLOSE_OBSERVATION_SECONDS:g} 秒观察期内未发现可查询的残留进程"
+            message += final_notice
+        except Exception as exc:
+            message += f"；关闭后复查失败：{exc}"
+        log_line(message)
         self.root.after(0, lambda m=message: self.status_callback(m))
 
     def stop(self) -> None:
-        return
+        self._close_stopped = True
 
 
 class TrayIcon:
@@ -1418,7 +1867,10 @@ class TrayIcon:
         try:
             menu.tk_popup(x, y)
         finally:
-            menu.grab_release()
+            try:
+                menu.grab_release()
+            finally:
+                menu.destroy()
 
     def _show_menu(self) -> None:
         menu = win32gui.CreatePopupMenu()
@@ -1490,232 +1942,6 @@ class TrayIcon:
             self.exit_callback()
         else:
             self.root.destroy()
-
-
-class BackupMonitorTab:
-    def __init__(self, parent: tk.Widget, config: Dict, save_callback: Callable[[], None]):
-        self.parent = parent
-        self.scale = current_scale(parent.winfo_toplevel())
-        self.config = config
-        self.save_callback = save_callback
-        backup_cfg = self.config.setdefault("backup", {})
-        backup_cfg.setdefault("sources", [])
-        backup_cfg.setdefault("backup_dir", str(DEFAULT_BACKUP_DIR))
-        backup_cfg.setdefault("monitor_enabled", False)
-
-        self.stop_event = threading.Event()
-        self.worker: Optional[threading.Thread] = None
-        self.pending: Dict[str, float] = {}
-        self.signatures: Dict[str, Tuple[int, int]] = {}
-        self.ui_queue: "queue.Queue[str]" = queue.Queue()
-
-        controls = ttk.Frame(parent, padding=scaled(12, self.scale))
-        controls.pack(fill=tk.X)
-        for col in range(3):
-            controls.columnconfigure(col, weight=1, uniform="backup_actions")
-        ttk.Button(controls, text="添加存档目录", command=self.add_source).grid(row=0, column=0, padx=scaled(4, self.scale), pady=scaled(4, self.scale), sticky=tk.EW)
-        ttk.Button(controls, text="移除选中", command=self.remove_selected).grid(row=0, column=1, padx=scaled(4, self.scale), pady=scaled(4, self.scale), sticky=tk.EW)
-        ttk.Button(controls, text="选择备份目录", command=self.choose_backup_dir).grid(row=0, column=2, padx=scaled(4, self.scale), pady=scaled(4, self.scale), sticky=tk.EW)
-        ttk.Button(controls, text="立即备份", command=self.backup_now).grid(row=1, column=0, padx=scaled(4, self.scale), pady=scaled(4, self.scale), sticky=tk.EW)
-
-        self.monitor_var = tk.BooleanVar(value=backup_cfg.get("monitor_enabled", False))
-        ttk.Checkbutton(controls, text="启动监控", variable=self.monitor_var, command=self.toggle_monitor).grid(row=1, column=1, padx=scaled(4, self.scale), pady=scaled(4, self.scale), sticky=tk.W)
-        self.backup_dir_var = tk.StringVar(value=backup_cfg["backup_dir"])
-        ttk.Label(parent, textvariable=self.backup_dir_var, padding=(12, 0)).pack(fill=tk.X)
-
-        self.listbox = tk.Listbox(parent, height=8)
-        self.listbox.configure(
-            bg=THEME["panel"],
-            fg=THEME["text"],
-            selectbackground=THEME["selection"],
-            selectforeground=THEME["text"],
-            highlightthickness=1,
-            highlightbackground=THEME["border"],
-            relief="flat",
-        )
-        self.listbox.pack(fill=tk.X, padx=scaled(12, self.scale), pady=scaled(8, self.scale))
-        for source in backup_cfg["sources"]:
-            self.listbox.insert(tk.END, source)
-
-        self.log = scrolledtext.ScrolledText(parent, height=12)
-        self.log.configure(
-            bg=THEME["panel"],
-            fg=THEME["text"],
-            insertbackground=THEME["text"],
-            selectbackground=THEME["selection"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=THEME["border"],
-        )
-        self.log.pack(fill=tk.BOTH, expand=True, padx=scaled(12, self.scale), pady=(0, scaled(12, self.scale)))
-        parent.after(300, self._drain_queue)
-        if self.monitor_var.get():
-            self.start_monitor()
-
-    def add_log(self, text: str) -> None:
-        self.ui_queue.put(text)
-        log_line(text)
-
-    def _drain_queue(self) -> None:
-        while True:
-            try:
-                msg = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            self.log.insert(tk.END, f"{msg}\n")
-            self.log.see(tk.END)
-        self.parent.after(300, self._drain_queue)
-
-    def add_source(self) -> None:
-        selected = filedialog.askdirectory(title="选择要监控的存档目录")
-        if not selected:
-            return
-        sources = self.config["backup"]["sources"]
-        if selected not in sources:
-            sources.append(selected)
-            self.listbox.insert(tk.END, selected)
-            self.save_callback()
-
-    def remove_selected(self) -> None:
-        selection = list(self.listbox.curselection())
-        if not selection:
-            return
-        sources = self.config["backup"]["sources"]
-        for index in reversed(selection):
-            value = self.listbox.get(index)
-            self.listbox.delete(index)
-            if value in sources:
-                sources.remove(value)
-        self.save_callback()
-
-    def choose_backup_dir(self) -> None:
-        selected = filedialog.askdirectory(title="选择备份保存目录")
-        if not selected:
-            return
-        self.config["backup"]["backup_dir"] = selected
-        self.backup_dir_var.set(selected)
-        self.save_callback()
-
-    def toggle_monitor(self) -> None:
-        enabled = self.monitor_var.get()
-        self.config["backup"]["monitor_enabled"] = enabled
-        self.save_callback()
-        if enabled:
-            self.start_monitor()
-        else:
-            self.stop_monitor()
-
-    def signature(self, folder: Path) -> Tuple[int, int]:
-        latest = 0
-        total_size = 0
-        for root, _, files in os.walk(folder):
-            for name in files:
-                path = Path(root) / name
-                try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-                latest = max(latest, stat.st_mtime_ns)
-                total_size += stat.st_size
-        return latest, total_size
-
-    def start_monitor(self) -> None:
-        if self.worker and self.worker.is_alive():
-            return
-        self.stop_event.clear()
-        self.worker = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.worker.start()
-        self.add_log("存档监控已启动。")
-
-    def stop_monitor(self) -> None:
-        self.stop_event.set()
-        self.add_log("存档监控已停止。")
-
-    def _monitor_loop(self) -> None:
-        while not self.stop_event.is_set():
-            now = time.time()
-            for source_text in list(self.config["backup"]["sources"]):
-                source = Path(source_text)
-                if not source.exists():
-                    continue
-                sig = self.signature(source)
-                old = self.signatures.get(source_text)
-                if old is None:
-                    self.signatures[source_text] = sig
-                elif old != sig:
-                    self.signatures[source_text] = sig
-                    self.pending[source_text] = now + 60
-                    self.add_log(f"检测到变化，稍后备份：{source}")
-
-            for source_text, ready_at in list(self.pending.items()):
-                if now >= ready_at:
-                    self.pending.pop(source_text, None)
-                    self.create_backup(Path(source_text))
-
-            self.stop_event.wait(30)
-
-    def backup_now(self) -> None:
-        sources = self.config["backup"]["sources"]
-        if not sources:
-            self.add_log("尚未添加存档目录，无法备份。")
-            return
-        for source_text in self.config["backup"]["sources"]:
-            self.create_backup(Path(source_text))
-
-    def unique_backup_path(self, backup_root: Path, safe_name: str) -> Path:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        candidate = backup_root / f"{safe_name}_{stamp}.zip"
-        index = 1
-        while candidate.exists():
-            candidate = backup_root / f"{safe_name}_{stamp}_{index}.zip"
-            index += 1
-        return candidate
-
-    def create_backup(self, source: Path) -> None:
-        if not source.exists():
-            self.add_log(f"目录不存在，跳过：{source}")
-            return
-        backup_root = Path(self.config["backup"]["backup_dir"])
-        backup_root.mkdir(parents=True, exist_ok=True)
-        safe_name = "".join(ch if ch not in '<>:"/\\|?*' else "_" for ch in source.name) or "Save"
-        zip_path = self.unique_backup_path(backup_root, safe_name)
-        try:
-            backup_root_resolved = backup_root.resolve()
-        except OSError:
-            backup_root_resolved = backup_root
-        try:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                for root, _, files in os.walk(source):
-                    root_path = Path(root)
-                    try:
-                        root_resolved = root_path.resolve()
-                        if root_resolved == backup_root_resolved or root_resolved.is_relative_to(backup_root_resolved):
-                            continue
-                    except OSError:
-                        pass
-                    for name in files:
-                        path = Path(root) / name
-                        try:
-                            if path.resolve() == zip_path.resolve():
-                                continue
-                            archive.write(path, path.relative_to(source.parent))
-                        except OSError:
-                            self.add_log(f"文件被占用，跳过：{path}")
-            self.prune_old_backups(backup_root, safe_name)
-            self.add_log(f"备份完成：{zip_path}")
-        except Exception as exc:
-            self.add_log(f"备份失败：{source} -> {exc}")
-
-    def prune_old_backups(self, backup_root: Path, safe_name: str) -> None:
-        backups = sorted(backup_root.glob(f"{safe_name}_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in backups[30:]:
-            try:
-                old.unlink()
-            except OSError:
-                pass
-
-    def stop(self) -> None:
-        self.stop_event.set()
 
 
 AUDIO_DEVICES = [
@@ -1926,7 +2152,7 @@ class AudioSwitchTab:
                 set_default_render_id(device["id"])
                 self.parent.after(0, lambda: self._audio_done(device["name"]))
             except Exception as exc:
-                self.parent.after(0, lambda: messagebox.showerror("切换失败", str(exc)))
+                self.parent.after(0, lambda error=str(exc): messagebox.showerror("切换失败", error))
             finally:
                 ole32.CoUninitialize()
 
@@ -1962,7 +2188,8 @@ class LiveShortcutTab:
 
     def _open_worker(self, title: str, url: str, mode: Optional[str]) -> None:
         try:
-            webbrowser.open(url)
+            if not webbrowser.open(url):
+                raise RuntimeError("浏览器未接受打开请求")
             if mode == "chenze":
                 import keyboard
                 import pyautogui
@@ -1977,7 +2204,7 @@ class LiveShortcutTab:
                     time.sleep(0.5)
             self.parent.after(0, lambda: self.status_callback(f"已打开：{title}"))
         except Exception as exc:
-            self.parent.after(0, lambda: messagebox.showerror("打开失败", str(exc)))
+            self.parent.after(0, lambda error=str(exc): messagebox.showerror("打开失败", error))
 
 
 class SystemToolsTab:
@@ -1992,22 +2219,16 @@ class SystemToolsTab:
         self.scale = current_scale(parent.winfo_toplevel())
         frame = ttk.Frame(parent, padding=scaled(18, self.scale))
         frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="系统工具", font=("Microsoft YaHei UI", scaled(18, self.scale), "bold")).pack(anchor=tk.W)
-        ttk.Button(
-            frame,
-            text="管理员运行 PowerShell 7",
-            command=self.open_admin_powershell7,
-        ).pack(anchor=tk.W, pady=(scaled(16, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
-        ttk.Button(
-            frame,
-            text="启动麦克风悬浮窗",
-            command=self.open_mic_toggle,
-        ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
-        ttk.Button(
-            frame,
-            text="关闭麦克风悬浮窗",
-            command=self.close_mic_toggle,
-        ).pack(anchor=tk.W, pady=(scaled(10, self.scale), 0), ipadx=scaled(20, self.scale), ipady=scaled(8, self.scale))
+        actions = ttk.Frame(frame)
+        actions.pack(fill=tk.X, pady=(0, scaled(6, self.scale)))
+        for column, (title, command) in enumerate((
+            ("管理员运行 PowerShell 7", self.open_admin_powershell7),
+            ("启动麦克风悬浮窗", self.open_mic_toggle),
+            ("关闭麦克风悬浮窗", self.close_mic_toggle),
+        )):
+            actions.columnconfigure(column, weight=1, uniform="system_actions")
+            ttk.Button(actions, text=title, command=command).grid(
+                row=0, column=column, sticky=tk.EW, padx=(0, scaled(8, self.scale)))
 
         target_box = ttk.LabelFrame(frame, text="选择要静音的麦克风", padding=scaled(12, self.scale))
         target_box.pack(anchor=tk.W, fill=tk.X, pady=(scaled(14, self.scale), 0))
@@ -2363,7 +2584,9 @@ class StartupTab:
         self.save_callback = save_callback
         self.status_callback = status_callback
         self.scale = current_scale(parent.winfo_toplevel())
-        startup_cfg = self.config.setdefault("startup", {})
+        stored_startup = self.config.get("startup")
+        startup_cfg = stored_startup if isinstance(stored_startup, dict) else {}
+        self.startup_cfg = startup_cfg
         if "autostart" not in startup_cfg:
             startup_cfg["autostart"] = is_autostart_enabled()
 
@@ -2392,16 +2615,21 @@ class StartupTab:
             self.autostart_var.set(not enabled)
             messagebox.showerror("启动项失败", str(exc))
             return
-        self.config.setdefault("startup", {})["autostart"] = enabled
-        self.save_callback()
+        self.startup_cfg["autostart"] = enabled
+        self.config["startup"] = self.startup_cfg
+        try:
+            self.save_callback()
+        except (OSError, ValueError) as exc:
+            self.refresh_state()
+            messagebox.showerror("保存配置失败", f"自启动状态已更新，但本地配置未能保存：{exc}", parent=self.parent)
+            return
         self.refresh_state()
         self.status_callback("开机自启已开启" if enabled else "开机自启已关闭")
 
     def refresh_state(self) -> None:
         enabled = is_autostart_enabled()
         self.autostart_var.set(enabled)
-        self.config.setdefault("startup", {})["autostart"] = enabled
-        self.save_callback()
+        self.startup_cfg["autostart"] = enabled
         self.state_var.set("当前状态：已开启开机自启" if enabled else "当前状态：未开启开机自启")
 
 
@@ -2409,6 +2637,8 @@ class LauncherTab:
     def __init__(self, parent: tk.Widget, status_callback: Callable[[str], None]):
         self.parent = parent
         self.status_callback = status_callback
+        self._close_lock = threading.Lock()
+        self._close_stopped = False
         self.config_file = APP_DIR / "launcher.json"
         self.groups: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
         self.current_group: Optional[str] = None
@@ -2426,7 +2656,7 @@ class LauncherTab:
         root.pack(fill=tk.BOTH, expand=True)
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
-        side = ttk.Frame(root, width=scaled(230, self.scale))
+        side = ttk.Frame(root, width=scaled(190, self.scale))
         side.grid(row=0, column=0, sticky=tk.NS, padx=(0, scaled(12, self.scale)))
         side.grid_propagate(False)
         ttk.Button(side, text="新建分组", command=self.create_group).pack(fill=tk.X, pady=2)
@@ -2441,21 +2671,24 @@ class LauncherTab:
         main.rowconfigure(1, weight=1)
         actions = ttk.Frame(main)
         actions.grid(row=0, column=0, sticky=tk.EW, pady=(0, scaled(8, self.scale)))
-        ttk.Button(actions, text="添加应用/文件", command=self.add_apps).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
-        ttk.Button(actions, text="删除选中", command=self.remove_selected).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
-        ttk.Button(actions, text="启动选中", command=self.launch_selected).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
-        ttk.Button(actions, text="启动当前组", command=self.launch_current_group).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
-        ttk.Button(actions, text="关闭当前组", command=self.close_current_group).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
-        ttk.Button(actions, text="修复失效路径", command=self.repair_current_group).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
+        for index, (title, command) in enumerate((
+            ("添加应用/文件", self.add_apps), ("删除选中", self.remove_selected),
+            ("启动选中", self.launch_selected), ("启动当前组", self.launch_current_group),
+            ("关闭当前组", self.close_current_group), ("修复失效路径", self.repair_current_group),
+        )):
+            actions.columnconfigure(index % 3, weight=1, uniform="launcher_actions")
+            ttk.Button(actions, text=title, command=command).grid(
+                row=index // 3, column=index % 3, sticky=tk.EW,
+                padx=(0, scaled(8, self.scale)), pady=scaled(3, self.scale))
 
         columns = ("name", "type", "path")
         self.app_tree = ttk.Treeview(main, columns=columns, show="headings", selectmode="extended")
-        for column, text, width in [("name", "名称", 220), ("type", "类型", 120), ("path", "路径", 560)]:
+        for column, text, width in [("name", "名称", 160), ("type", "类型", 90), ("path", "路径", 420)]:
             self.app_tree.heading(column, text=text)
             self.app_tree.column(column, width=scaled(width, self.scale))
         self.app_tree.grid(row=1, column=0, sticky=tk.NSEW)
         self.app_tree.bind("<Double-1>", lambda _event: self.launch_selected())
-        self.log_text = scrolledtext.ScrolledText(main, height=6)
+        self.log_text = DarkScrolledText(main, height=6)
         self.log_text.grid(row=2, column=0, sticky=tk.EW, pady=(scaled(8, self.scale), 0))
 
     def file_type(self, path: str) -> str:
@@ -2509,10 +2742,11 @@ class LauncherTab:
         if not self.current_group:
             return
         name = simpledialog.askstring("重命名分组", "新的分组名称：", initialvalue=self.current_group, parent=self.parent)
+        name = name.strip() if name else ""
         if not name or name in self.groups:
             return
-        self.groups[name.strip()] = self.groups.pop(self.current_group)
-        self.current_group = name.strip()
+        self.groups[name] = self.groups.pop(self.current_group)
+        self.current_group = name
         self.save_config()
         self.refresh_groups()
 
@@ -2542,8 +2776,10 @@ class LauncherTab:
     def remove_selected(self) -> None:
         if not self.current_group:
             return
-        names = {self.app_tree.item(item, "values")[0] for item in self.app_tree.selection()}
-        self.groups[self.current_group]["apps"] = [app for app in self.groups[self.current_group]["apps"] if app["name"] not in names]
+        indices = {self.app_tree.index(item) for item in self.app_tree.selection()}
+        self.groups[self.current_group]["apps"] = [
+            app for index, app in enumerate(self.groups[self.current_group]["apps"]) if index not in indices
+        ]
         self.save_config()
         self.refresh_groups()
         self.refresh_apps()
@@ -2559,72 +2795,144 @@ class LauncherTab:
             self.launch_apps(selected_apps)
 
     def launch_apps(self, apps: List[Dict[str, str]]) -> None:
-        threading.Thread(target=self._launch_worker, args=(apps,), daemon=True).start()
+        self._start_launcher_operation(self._launch_worker, apps)
+
+    def _start_launcher_operation(self, operation, apps) -> None:
+        if getattr(self, "_close_stopped", False):
+            return
+        if getattr(self, "_launcher_close_pending", False):
+            self.log("关闭请求正在等待或执行，请完成后再启动或修复应用。")
+            return
+        if getattr(self, "_launcher_busy", False):
+            return
+        cancel = self._launcher_cancel = threading.Event()
+        idle = self._launcher_idle = threading.Event()
+        self._launcher_busy = True
+        selected_apps = list(apps)
+
+        def worker():
+            try:
+                if not cancel.is_set() and not getattr(self, "_close_stopped", False):
+                    operation(selected_apps)
+            except Exception as exc:
+                if not getattr(self, "_close_stopped", False):
+                    try:
+                        self.parent.after(0, lambda error=str(exc): self.log(f"应用操作失败：{error}"))
+                    except (RuntimeError, tk.TclError):
+                        pass
+            finally:
+                self._launcher_busy = False
+                idle.set()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as exc:
+            self._launcher_busy = False
+            idle.set()
+            self.log(f"应用操作启动失败：{exc}")
+
+    def _launcher_cancelled(self) -> bool:
+        cancel = getattr(self, "_launcher_cancel", None)
+        return getattr(self, "_close_stopped", False) or (cancel is not None and cancel.is_set())
+
+    def _queue_launcher_close(self, work) -> None:
+        if getattr(self, "_close_stopped", False):
+            return
+        if getattr(self, "_launcher_close_pending", False):
+            self.log("关闭请求已在等待或执行，请稍候。")
+            return
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = self._close_lock = threading.Lock()
+        if not close_lock.acquire(blocking=False):
+            self.log("关闭请求已在执行，请稍候。")
+            return
+        self._launcher_close_pending = True
+        cancel = getattr(self, "_launcher_cancel", None)
+        if cancel is not None:
+            cancel.set()
+        idle = getattr(self, "_launcher_idle", None)
+        if idle is not None and not idle.is_set():
+            self.log("已取消后续启动/修复项，正在等待当前操作返回后关闭应用。")
+
+        def close_after_current_operation():
+            try:
+                while idle is not None and not idle.is_set():
+                    if getattr(self, "_close_stopped", False):
+                        return
+                    idle.wait(0.05)
+                if not getattr(self, "_close_stopped", False):
+                    work()
+            except Exception as exc:
+                if not getattr(self, "_close_stopped", False):
+                    try:
+                        self.parent.after(0, lambda error=str(exc): self.log(f"关闭失败：{error}"))
+                    except (RuntimeError, tk.TclError):
+                        pass
+            finally:
+                close_lock.release()
+                self._launcher_close_pending = False
+
+        try:
+            threading.Thread(target=close_after_current_operation, daemon=True).start()
+        except Exception as exc:
+            close_lock.release()
+            self._launcher_close_pending = False
+            self.log(f"关闭请求启动失败：{exc}")
 
     def repair_current_group(self) -> None:
         if not self.current_group:
             return
         apps = self.groups.get(self.current_group, {}).get("apps", [])
-        threading.Thread(target=self._repair_worker, args=(apps,), daemon=True).start()
+        self._start_launcher_operation(self._repair_worker, apps)
 
     def close_current_group(self) -> None:
         if self.current_group:
-            paths: List[str] = []
-            for app in self.groups[self.current_group]["apps"]:
-                if app.get("path"):
-                    paths.append(app["path"])
-                learned_paths = app.get("close_paths", [])
-                if isinstance(learned_paths, list):
-                    paths.extend(str(path) for path in learned_paths if path)
-            self.close_paths(paths)
+            apps = list(self.groups[self.current_group]["apps"])
+            self._queue_launcher_close(lambda: self._close_worker(launcher_close_paths(apps)))
 
     def close_paths(self, paths: List[str]) -> None:
-        threading.Thread(target=self._close_worker, args=(paths,), daemon=True).start()
+        selected = list(paths)
+        self._queue_launcher_close(lambda: self._close_worker(selected))
+
+    def stop(self) -> None:
+        self._close_stopped = True
+        cancel = getattr(self, "_launcher_cancel", None)
+        if cancel is not None:
+            cancel.set()
 
     def _launch_worker(self, apps: List[Dict[str, str]]) -> None:
-        learned_any = False
         repaired_any = False
-        before = running_process_paths()
-        launched_apps: List[Dict[str, str]] = []
         for app in apps:
+            if self._launcher_cancelled():
+                break
             path = app.get("path", "")
-            repaired_path = self._ensure_launch_path(app, max_seconds=5)
-            if repaired_path and repaired_path != path:
-                path = repaired_path
-                repaired_any = True
             try:
+                repaired_path = self._ensure_launch_path(app, max_seconds=5)
+                if repaired_path and repaired_path != path:
+                    path = repaired_path
+                    repaired_any = True
+                if self._launcher_cancelled():
+                    break
                 if Path(path).suffix.lower() == ".url":
-                    for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
-                        if line.startswith("URL="):
-                            webbrowser.open(line[4:].strip())
-                            break
+                    raw = Path(path).read_bytes()
+                    encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+                    try:
+                        content = raw.decode(encoding)
+                    except UnicodeDecodeError:
+                        content = raw.decode("mbcs")
+                    urls = [line.split("=", 1)[1].strip() for line in content.splitlines() if line.strip().casefold().startswith("url=")]
+                    if not urls or not urls[0]:
+                        raise ValueError("网址快捷方式缺少有效 URL")
+                    if not webbrowser.open(urls[0]):
+                        raise RuntimeError("浏览器未接受打开请求")
                 else:
                     os.startfile(path)
-                launched_apps.append(app)
                 self.parent.after(0, lambda p=path: self.log(f"已启动：{Path(p).name}"))
             except Exception as exc:
                 self.parent.after(0, lambda p=path, e=exc: self.log(f"启动失败：{Path(p).name} - {e}"))
 
-        if len(launched_apps) == 1:
-            # 以前每个应用启动后都固定等待 2 秒；4 个应用就是至少 8 秒。
-            # 现在启动请求先立即发出，再只在后台学习 close_paths。
-            # 用户感知的启动速度接近 os.startfile 本身，学习进程路径不阻塞后续启动。
-            learned_paths: List[str] = []
-            for delay in (0.6, 1.6):
-                time.sleep(delay)
-                learned_paths.extend(discover_new_process_paths(before, running_process_paths()))
-            if learned_paths:
-                app = launched_apps[0]
-                existing = app.setdefault("close_paths", [])
-                if isinstance(existing, list):
-                    seen = {normalize_process_path(item) for item in existing}
-                    for process_path in learned_paths:
-                        normalized = normalize_process_path(process_path)
-                        if normalized not in seen:
-                            existing.append(process_path)
-                            seen.add(normalized)
-                            learned_any = True
-        if learned_any or repaired_any:
+        if repaired_any and not getattr(self, "_close_stopped", False):
             self.parent.after(0, self.save_config)
             self.parent.after(0, self.refresh_apps)
 
@@ -2632,10 +2940,14 @@ class LauncherTab:
         repaired = 0
         missing = 0
         for app in apps:
+            if self._launcher_cancelled():
+                break
             old_path = app.get("path", "")
             if old_path and Path(old_path).exists():
                 continue
             found = self._find_relocated_path(app, max_seconds=LAUNCHER_REPAIR_MAX_SECONDS)
+            if self._launcher_cancelled():
+                break
             if found:
                 app["path"] = found
                 app["type"] = self.file_type(found)
@@ -2644,17 +2956,20 @@ class LauncherTab:
             else:
                 missing += 1
                 self.parent.after(0, lambda n=app.get("name", Path(old_path).name): self.log(f"未找到新位置：{n}"))
+        if getattr(self, "_close_stopped", False):
+            return
         if repaired:
             self.parent.after(0, self.save_config)
             self.parent.after(0, self.refresh_apps)
-        self.parent.after(0, lambda: self.log(f"路径修复完成：修复 {repaired} 个，未找到 {missing} 个"))
+        outcome = "已停止" if self._launcher_cancelled() else "完成"
+        self.parent.after(0, lambda: self.log(f"路径修复{outcome}：修复 {repaired} 个，未找到 {missing} 个"))
 
     def _ensure_launch_path(self, app: Dict[str, str], max_seconds: int = 5) -> str:
         path = app.get("path", "")
         if path and Path(path).exists():
             return path
         found = self._find_relocated_path(app, max_seconds=max_seconds)
-        if not found:
+        if not found or self._launcher_cancelled():
             return path
         old_path = path
         app["path"] = found
@@ -2785,42 +3100,140 @@ class LauncherTab:
         return sorted(matches, key=score)[0]
 
     def _close_worker(self, paths: List[str]) -> None:
-        targets = [path for path in paths if Path(path).suffix.lower() in LAUNCHER_CLOSE_EXTENSIONS]
-        if not targets:
-            self.parent.after(0, lambda: self.log("当前组没有可按进程关闭的应用"))
+        if getattr(self, "_close_stopped", False):
             return
-        matches = match_processes_for_paths(targets, running_process_paths())
+        resolved, input_errors = resolve_process_close_targets(paths)
+        input_error_summary = f"；目标失败 {len(input_errors)} 项；{input_errors[0]}" if input_errors else ""
+        for error in input_errors:
+            self.parent.after(0, lambda e=error: self.log(f"关闭目标失败：{e}"))
+        try:
+            targets = [path for path in resolved if Path(path).suffix.lower() in PROCESS_EXECUTABLE_EXTENSIONS]
+            if not targets:
+                message = f"当前组没有可按进程关闭的应用{input_error_summary}"
+                self.parent.after(0, lambda m=message: self.log(m))
+                return
+            processes = running_process_paths()
+            snapshot_notice = process_snapshot_notice(processes)
+            matches = match_processes_for_paths(targets, processes, include_directory_scope=False)
+        except Exception as exc:
+            message = f"关闭失败：{exc}{input_error_summary}"
+            self.parent.after(0, lambda m=message: self.log(m))
+            return
         if not matches:
-            self.parent.after(0, lambda: self.log("当前组没有找到正在运行的应用"))
+            message = f"当前组没有找到可查询的运行中应用{input_error_summary}{snapshot_notice}"
+            self.parent.after(0, lambda m=message: self.log(m))
             return
         pid_to_path = {pid: process_path for pid, process_path in matches}
-        closed, failures = terminate_processes_fast(pid_to_path)
+        if getattr(self, "_close_stopped", False):
+            return
+        try:
+            closed, failures = terminate_processes_fast(pid_to_path, include_children=False, expected_paths=pid_to_path)
+        except Exception as exc:
+            message = f"关闭失败：{exc}{input_error_summary}"
+            self.parent.after(0, lambda m=message: self.log(m))
+            return
+        if getattr(self, "_close_stopped", False):
+            return
         for pid in sorted(closed):
             process_path = pid_to_path.get(pid, str(pid))
-            self.parent.after(0, lambda p=process_path: self.log(f"已关闭：{Path(p).name}"))
+            self.parent.after(0, lambda p=process_path, i=pid: self.log(f"已确认进程退出：{Path(p).name}（PID {i}）"))
         for pid, error in failures.items():
             process_path = pid_to_path.get(pid, str(pid))
             self.parent.after(0, lambda p=process_path, e=error: self.log(f"关闭失败：{Path(p).name} - {e}"))
+        residual_message = ""
+        try:
+            remaining, final_notice, cancelled = observe_closed_process_targets(
+                targets, should_stop=lambda: getattr(self, "_close_stopped", False)
+            )
+            if cancelled:
+                return
+            if remaining:
+                details = "、".join(f"{Path(path).name}（PID {pid}）" for pid, path in remaining)
+                message = f"关闭后观察期内仍有相关进程运行：{details}"
+                if any(pid in closed or pid not in pid_to_path for pid, _path in remaining):
+                    message += "；可能被重新启动"
+                message += final_notice
+                residual_message = message
+                self.parent.after(0, lambda m=message: self.log(m))
+            else:
+                residual_message = f"{PROCESS_CLOSE_OBSERVATION_SECONDS:g} 秒观察期内未发现可查询的残留进程{final_notice}"
+                self.parent.after(0, lambda m=residual_message: self.log(m))
+        except Exception as exc:
+            message = f"关闭后复查失败：{exc}"
+            residual_message = message
+            self.parent.after(0, lambda m=message: self.log(m))
+        if input_errors:
+            message = f"关闭完成：已确认退出 {len(closed)} 个，进程失败 {len(failures)} 个{input_error_summary}"
+            if residual_message:
+                message += f"；{residual_message}"
+            self.parent.after(0, lambda m=message: self.log(m))
 
     def log(self, message: str) -> None:
         self.log_text.insert(tk.END, f"[{datetime.now():%H:%M:%S}] {message}\n")
         self.log_text.see(tk.END)
         self.status_callback(message)
 
-    def save_config(self) -> None:
-        ensure_app_dir()
-        payload = {"groups": self.groups, "current_group": self.current_group}
-        self.config_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    @staticmethod
+    def _validate_config(payload: object) -> Dict:
+        if not isinstance(payload, dict) or not isinstance(payload.get("groups", {}), dict):
+            raise ValueError("启动器配置必须包含合法的分组对象")
+        for name, group in payload.get("groups", {}).items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(group, dict):
+                raise ValueError("启动器分组名称或内容无效")
+            if not isinstance(group.get("apps", []), list):
+                raise ValueError(f"分组 {name} 的应用列表无效")
+            for app in group.get("apps", []):
+                if not isinstance(app, dict) or not isinstance(app.get("path"), str) or not app["path"].strip():
+                    raise ValueError(f"分组 {name} 含有无效的应用路径")
+        return payload
+
+    def save_config(self) -> bool:
+        temporary = self.config_file.with_name(f"{self.config_file.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            current = self.config_file.read_bytes() if self.config_file.exists() else None
+            if getattr(self, "_config_read_error", None):
+                raise ValueError("原启动器配置无法读取，已保留原文件；请修复后重新打开工具箱。")
+            if hasattr(self, "_loaded_config_bytes") and current != self._loaded_config_bytes:
+                raise ValueError("启动器配置已被其他程序修改，请重新打开工具箱后再保存。")
+            existing = self._validate_config(json.loads(current.decode("utf-8-sig"))) if current is not None else {}
+            payload = {**existing, "groups": self.groups, "current_group": self.current_group}
+            self._validate_config(payload)
+            encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_bytes(encoded)
+            os.replace(temporary, self.config_file)
+            self._loaded_config_bytes = encoded
+            return True
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror("保存启动器配置失败", str(exc), parent=self.parent)
+            return False
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
     def load_config(self) -> None:
-        if not self.config_file.exists():
-            return
+        self._config_read_error = None
+        self._loaded_config_bytes = None
         try:
-            payload = json.loads(self.config_file.read_text(encoding="utf-8"))
-            self.groups = payload.get("groups", {}) if isinstance(payload.get("groups"), dict) else {}
-            self.current_group = payload.get("current_group")
-        except Exception:
+            if not self.config_file.exists():
+                return
+            self._loaded_config_bytes = self.config_file.read_bytes()
+            payload = self._validate_config(json.loads(self._loaded_config_bytes.decode("utf-8-sig")))
+            self.groups = payload.get("groups", {})
+            for group in self.groups.values():
+                group.setdefault("apps", [])
+                for app in group["apps"]:
+                    if not isinstance(app.get("name"), str) or not app["name"]:
+                        app["name"] = Path(app["path"]).name
+                    if not isinstance(app.get("type"), str):
+                        app["type"] = self.file_type(app["path"])
+            current = payload.get("current_group")
+            self.current_group = current if isinstance(current, str) and current in self.groups else next(iter(self.groups), None)
+        except (OSError, ValueError, TypeError) as exc:
+            self._config_read_error = str(exc)
             self.groups = {}
+            self.current_group = None
+            messagebox.showerror("读取启动器配置失败", f"{exc}\n原配置已保留，本次不会覆盖。", parent=self.parent)
 
 
 class MediaOrganizerTab:
@@ -2829,6 +3242,7 @@ class MediaOrganizerTab:
         self.status_callback = status_callback
         self.scale = current_scale(parent.winfo_toplevel())
         self.manifest = None
+        self.busy = False
         self._build()
 
     def _build(self) -> None:
@@ -2845,12 +3259,13 @@ class MediaOrganizerTab:
         ttk.Button(frame, text="选择", command=lambda: self.pick_dir(self.output_var)).grid(row=1, column=2)
         buttons = ttk.Frame(frame)
         buttons.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=scaled(8, self.scale))
-        ttk.Button(buttons, text="扫描预览", command=self.scan).pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
+        self.scan_button = ttk.Button(buttons, text="扫描预览", command=self.scan)
+        self.scan_button.pack(side=tk.LEFT, padx=(0, scaled(8, self.scale)))
         self.execute_button = ttk.Button(buttons, text="确认执行", command=self.execute, state=tk.DISABLED)
         self.execute_button.pack(side=tk.LEFT)
         self.summary_var = tk.StringVar(value="等待扫描")
         ttk.Label(frame, textvariable=self.summary_var).grid(row=3, column=0, columnspan=3, sticky=tk.EW)
-        self.log_text = scrolledtext.ScrolledText(frame, height=20)
+        self.log_text = DarkScrolledText(frame, height=20)
         self.log_text.grid(row=4, column=0, columnspan=3, sticky=tk.NSEW, pady=(scaled(8, self.scale), 0))
         frame.rowconfigure(4, weight=1)
 
@@ -2860,26 +3275,34 @@ class MediaOrganizerTab:
             variable.set(selected)
 
     def scan(self) -> None:
+        if self.busy:
+            return
         if not all([AppConfig, scan_media, save_manifest, write_json]):
             messagebox.showerror("缺少依赖", "照片视频管家模块不可用。")
             return
-        if not self.source_var.get() or not self.output_var.get():
+        source_dir, output_dir = self.source_var.get(), self.output_var.get()
+        if not source_dir or not output_dir:
             messagebox.showwarning("缺少目录", "请先选择源目录和输出目录。")
             return
-        self.execute_button.configure(state=tk.DISABLED)
+        config = AppConfig(source_dir=source_dir, output_dir=output_dir)
+        self.manifest = None
+        self._set_busy(True)
         self.summary_var.set("正在扫描...")
-        threading.Thread(target=self._scan_worker, daemon=True).start()
-
-    def _scan_worker(self) -> None:
         try:
-            output = Path(self.output_var.get())
-            manifest = scan_media(AppConfig(source_dir=self.source_var.get(), output_dir=self.output_var.get()))
+            threading.Thread(target=self._scan_worker, args=(config,), daemon=True).start()
+        except Exception as exc:
+            self._task_failed("扫描失败", str(exc))
+
+    def _scan_worker(self, config) -> None:
+        try:
+            output = Path(config.output_dir)
+            manifest = scan_media(config)
             output.mkdir(parents=True, exist_ok=True)
             write_json(output / "config.json", manifest.to_dict()["config"])
             save_manifest(manifest, output)
             self.parent.after(0, lambda: self._scan_done(manifest))
         except Exception as exc:
-            self.parent.after(0, lambda: messagebox.showerror("扫描失败", str(exc)))
+            self.parent.after(0, lambda error=str(exc): self._task_failed("扫描失败", error))
 
     def _scan_done(self, manifest) -> None:
         self.manifest = manifest
@@ -2893,27 +3316,44 @@ class MediaOrganizerTab:
         warnings = Counter(error for item in manifest.items for error in item.errors)
         for error, count in warnings.most_common():
             self.log_text.insert(tk.END, f"{error}：{count} 个\n")
-        self.execute_button.configure(state=tk.NORMAL)
+        self._set_busy(False)
         self.status_callback("照片视频扫描完成")
 
     def execute(self) -> None:
-        if not self.manifest or not execute_plan:
+        if self.busy or not self.manifest or not execute_plan:
             return
-        self.execute_button.configure(state=tk.DISABLED)
+        manifest = self.manifest
+        self._set_busy(True)
         self.summary_var.set("正在执行复制和报告生成...")
-        threading.Thread(target=self._execute_worker, daemon=True).start()
-
-    def _execute_worker(self) -> None:
         try:
-            result = execute_plan(self.manifest, lambda message: self.parent.after(0, lambda m=message: self.log_text.insert(tk.END, m + "\n")))
+            threading.Thread(target=self._execute_worker, args=(manifest,), daemon=True).start()
+        except Exception as exc:
+            self._task_failed("执行失败", str(exc))
+
+    def _execute_worker(self, manifest) -> None:
+        try:
+            result = execute_plan(manifest, lambda message: self.parent.after(0, lambda m=message: self.log_text.insert(tk.END, m + "\n")))
             self.parent.after(0, lambda: self._execute_done(result))
         except Exception as exc:
-            self.parent.after(0, lambda: messagebox.showerror("执行失败", str(exc)))
+            self.parent.after(0, lambda error=str(exc): self._task_failed("执行失败", error))
 
     def _execute_done(self, result: Dict) -> None:
+        self.manifest = None
+        self._set_busy(False)
         self.summary_var.set(f"执行完成：复制 {len(result['copied'])}，压缩成功 {len(result['compressed'])}，跳过/失败 {len(result['skipped'])}，复制失败 {len(result['failed'])}")
         self.log_text.insert(tk.END, f"地点 CSV：{result.get('locations_report_csv')}\n")
         self.status_callback("照片视频整理完成")
+
+    def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.scan_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.execute_button.configure(state=tk.NORMAL if not busy and self.manifest is not None else tk.DISABLED)
+
+    def _task_failed(self, title: str, error: str) -> None:
+        self._set_busy(False)
+        self.summary_var.set(f"{title}：{error}")
+        self.status_callback(title)
+        messagebox.showerror(title, error)
 
 
 
@@ -2921,7 +3361,7 @@ class MacroToolsTab:
     def __init__(self, parent: ttk.Frame, status_callback: Callable[[str], None]):
         self.parent = parent
         self.status_callback = status_callback
-        self.macro_json_var = tk.StringVar(value=str(Path.home() / "Desktop" / "macro_recording.json"))
+        self.macro_json_var = tk.StringVar(value=str(macro_recording_path()))
         self.loop_hotkey_var = tk.StringVar(value="mouse:x1")
         self.loop_interval_var = tk.StringVar(value="0.1")
         self._build()
@@ -2964,7 +3404,7 @@ class MacroToolsTab:
         ttk.Button(actions, text="\u542f\u52a8\u5faa\u73af\u56de\u653e", command=self.launch_loop_player).grid(row=0, column=1, sticky=tk.EW, padx=4, pady=4)
         ttk.Button(actions, text="\u5b89\u88c5/\u68c0\u67e5\u4f9d\u8d56", command=self.install_requirements).grid(row=0, column=2, sticky=tk.EW, padx=4, pady=4)
         ttk.Button(actions, text="\u6253\u5f00\u5b8f\u5de5\u5177\u76ee\u5f55", command=self.open_macro_tools_folder).grid(row=1, column=0, sticky=tk.EW, padx=4, pady=4)
-        ttk.Button(actions, text="\u6253\u5f00\u684c\u9762\u5b8f\u6587\u4ef6", command=self.open_default_macro_json).grid(row=1, column=1, sticky=tk.EW, padx=4, pady=4)
+        ttk.Button(actions, text="打开默认宏文件", command=self.open_default_macro_json).grid(row=1, column=1, sticky=tk.EW, padx=4, pady=4)
         ttk.Button(actions, text="\u590d\u5236\u4e00\u952e\u542f\u52a8 BAT \u5230\u684c\u9762", command=self.create_desktop_loop_bat).grid(row=1, column=2, sticky=tk.EW, padx=4, pady=4)
 
         info = ttk.LabelFrame(outer, text="\u5f53\u524d\u89c4\u5219", padding=12)
@@ -3018,12 +3458,10 @@ class MacroToolsTab:
 
     def _launch_python_script(self, script: Path, args: Optional[List[str]] = None, new_console: bool = False, windowed: bool = False) -> None:
         if not script.exists():
-            messagebox.showerror("\u542f\u52a8\u5931\u8d25", f"\u627e\u4e0d\u5230\u811a\u672c\uff1a\n{script}")
-            return
+            raise FileNotFoundError(f"找不到脚本：{script}")
         python_exe = self._python_executable(prefer_windowed=windowed)
         if not python_exe:
-            messagebox.showerror("\u542f\u52a8\u5931\u8d25", "\u627e\u4e0d\u5230 Python\uff0c\u4e5f\u6ca1\u6709\u53ef\u7528\u7684\u5185\u7f6e exe\u3002")
-            return
+            raise RuntimeError("找不到 Python，也没有可用的内置 exe。")
         cmd = [python_exe, str(script)] + list(args or [])
         flags = 0
         if os.name == "nt" and new_console:
@@ -3061,6 +3499,8 @@ class MacroToolsTab:
             interval = float((self.loop_interval_var.get().strip() or "0.1"))
         except ValueError:
             raise ValueError("\u5faa\u73af\u95f4\u9694\u5fc5\u987b\u662f\u6570\u5b57")
+        if not math.isfinite(interval):
+            raise ValueError("循环间隔必须是有限数字")
         if interval < 0:
             raise ValueError("\u5faa\u73af\u95f4\u9694\u4e0d\u80fd\u5c0f\u4e8e 0")
         if interval > 3600:
@@ -3068,7 +3508,7 @@ class MacroToolsTab:
         return hotkey, interval
 
     def launch_loop_player(self) -> None:
-        macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
+        macro_json = self.macro_json_var.get().strip() or str(macro_recording_path())
         if not Path(macro_json).exists():
             messagebox.showerror("\u5b8f\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u627e\u4e0d\u5230\u5b8f JSON\uff1a\n{macro_json}")
             return
@@ -3110,17 +3550,17 @@ class MacroToolsTab:
         os.startfile(str(folder))
 
     def open_default_macro_json(self) -> None:
-        path = Path.home() / "Desktop" / "macro_recording.json"
+        path = macro_recording_path()
         if path.exists():
             os.startfile(str(path))
         else:
-            messagebox.showinfo("\u6587\u4ef6\u4e0d\u5b58\u5728", f"\u684c\u9762\u6ca1\u6709\u5b8f\u6587\u4ef6\uff1a\n{path}")
+            messagebox.showinfo("\u6587\u4ef6\u4e0d\u5b58\u5728", f"默认宏文件不存在：\n{path}")
 
     def create_desktop_loop_bat(self) -> None:
         folder = self.macro_tools_dir()
         script = folder / "interception_loop_macro.py"
         exe = folder / "interception_loop_macro.exe"
-        macro_json = self.macro_json_var.get().strip() or str(Path.home() / "Desktop" / "macro_recording.json")
+        macro_json = self.macro_json_var.get().strip() or str(macro_recording_path())
         hotkey, interval = self.loop_settings()
         desktop = Path.home() / "Desktop"
         bat = desktop / "run_interception_macro.bat"
@@ -3134,7 +3574,7 @@ class MacroToolsTab:
             f"{command}\n"
             "pause\n"
         )
-        bat.write_text(content, encoding="ascii", errors="ignore")
+        bat.write_text(content, encoding="utf-8", newline="\r\n")
         self.status_callback(f"\u5df2\u5199\u5165 {bat}")
         messagebox.showinfo("\u5df2\u521b\u5efa", f"\u5df2\u521b\u5efa\u684c\u9762\u542f\u52a8\u5668\uff1a\n{bat}")
 
@@ -3152,7 +3592,8 @@ class UtilityToolbox:
             except tk.TclError:
                 pass
         self.root.configure(bg=THEME["bg"])
-        self.root.minsize(scaled(700, self.scale), scaled(540, self.scale))
+        self.root.minsize(min(scaled(980, self.scale), root.winfo_screenwidth() - 40),
+                          min(scaled(720, self.scale), root.winfo_screenheight() - 80))
         self.center_window()
 
         self.status_var = tk.StringVar(value="就绪")
@@ -3161,98 +3602,53 @@ class UtilityToolbox:
         self.window_refresh_job: Optional[str] = None
         self._setup_style()
 
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill=tk.BOTH, expand=True)
-
-        renamer_frame = ttk.Frame(notebook)
-        topmost_frame = ttk.Frame(notebook, padding=scaled(18, self.scale))
-        backup_frame = ttk.Frame(notebook)
-        subtitle_frame = tk.Frame(notebook, bg=THEME["bg"])
-        audio_frame = ttk.Frame(notebook)
-        live_frame = ttk.Frame(notebook)
-        system_frame = ttk.Frame(notebook)
-        startup_frame = ttk.Frame(notebook)
-        launcher_frame = ttk.Frame(notebook)
-        media_frame = ttk.Frame(notebook)
-        macro_frame = ttk.Frame(notebook)
-
-        notebook.add(renamer_frame, text="批量重命名")
-        notebook.add(topmost_frame, text="窗口置顶")
-        notebook.add(backup_frame, text="存档备份")
-        notebook.add(subtitle_frame, text="视频字幕同步")
-        notebook.add(audio_frame, text="音频输出")
-        notebook.add(live_frame, text="直播快捷")
-        notebook.add(system_frame, text="系统工具")
-        notebook.add(startup_frame, text="自启动")
-        notebook.add(launcher_frame, text="应用启动器")
-        notebook.add(media_frame, text="照片视频管家")
-        notebook.add(macro_frame, text="\u5b8f\u5de5\u5177")
+        self.shell = ToolboxShell(root, self.scale, self.status_var)
+        renamer_frame = self.shell.page("renamer")
+        topmost_frame = self.shell.page("topmost")
+        topmost_frame.configure(padding=scaled(18, self.scale))
+        backup_frame = self.shell.page("backup")
+        subtitle_frame = self.shell.page("subtitle")
+        audio_frame = self.shell.page("audio")
+        live_frame = self.shell.page("live")
+        system_frame = self.shell.page("system")
+        startup_frame = self.shell.page("startup")
+        launcher_frame = self.shell.page("launcher")
+        media_frame = self.shell.page("media")
+        macro_frame = self.shell.page("macro")
 
         self.renamer = DateRenamerTab(renamer_frame)
         self.topmost = TopmostController(root, self.set_status)
         self.drop_close = DropCloseController(root, self.set_status)
         self.tray = TrayIcon(root, self.topmost, self.quit_app)
         self._build_topmost_tab(topmost_frame)
-        self.backup = BackupMonitorTab(backup_frame, self.config, self.save_config)
+        self.backup = GameSaveManagerTab(backup_frame, self.config, self.save_config)
         self.subtitle = SubtitleSyncApp(subtitle_frame, embedded=True)
         self.audio = AudioSwitchTab(audio_frame, self.set_status)
         self.live_shortcuts = LiveShortcutTab(live_frame, self.set_status)
         self.system_tools = SystemToolsTab(system_frame, self.set_status)
         self.startup = StartupTab(startup_frame, self.config, self.save_config, self.set_status)
         self.launcher = LauncherTab(launcher_frame, self.set_status)
+        self.drop_close._close_coordinator = self.launcher._queue_launcher_close
         self.media = MediaOrganizerTab(media_frame, self.set_status)
         self.macro_tools = MacroToolsTab(macro_frame, self.set_status)
 
-        status = ttk.Label(root, textvariable=self.status_var, anchor=tk.W, padding=(8, 4))
-        status.pack(fill=tk.X)
+        self.shell.finish()
+        self.subtitle._on_focus_out(None)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         if start_minimized:
             self.root.after(0, self.root.withdraw)
 
     def _setup_style(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        self.root.tk.call("tk", "scaling", 1.0 + (self.scale - 1.0) * 0.75)
-        base_size = scaled(14, self.scale)
-        title_size = scaled(18, self.scale)
-        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-            try:
-                tkfont.nametofont(font_name).configure(family="Microsoft YaHei UI", size=base_size)
-            except tk.TclError:
-                pass
-        try:
-            tkfont.nametofont("TkHeadingFont").configure(weight="bold")
-        except tk.TclError:
-            pass
+        setup_theme(self.root, self.scale)
 
-        padding = (scaled(14, self.scale), scaled(9, self.scale))
-        style.configure(".", font=("Microsoft YaHei UI", base_size), background=THEME["bg"], foreground=THEME["text"])
-        style.configure("TFrame", background=THEME["bg"])
-        style.configure("TLabel", background=THEME["bg"], foreground=THEME["text"])
-        style.configure("TButton", background=THEME["panel"], foreground=THEME["text"], bordercolor=THEME["border"], focusthickness=1, focuscolor=THEME["accent"], padding=padding)
-        style.map("TButton", background=[("active", THEME["panel_alt"]), ("pressed", THEME["selection"])], foreground=[("disabled", THEME["muted"])])
-        style.configure("TCheckbutton", background=THEME["bg"], foreground=THEME["text"])
-        style.map("TCheckbutton", background=[("active", THEME["bg"])], foreground=[("active", THEME["text"])])
-        style.configure("TEntry", fieldbackground=THEME["panel"], foreground=THEME["text"], bordercolor=THEME["border"], insertcolor=THEME["text"], padding=scaled(4, self.scale))
-        style.configure("TCombobox", fieldbackground=THEME["panel"], foreground=THEME["text"], bordercolor=THEME["border"], arrowcolor=THEME["accent"], padding=scaled(4, self.scale))
-        style.configure("Treeview", background=THEME["panel"], fieldbackground=THEME["panel"], foreground=THEME["text"], bordercolor=THEME["border"], rowheight=scaled(40, self.scale))
-        style.configure("Treeview.Heading", background=THEME["panel_alt"], foreground=THEME["text"], relief="flat", font=("Microsoft YaHei UI", base_size, "bold"), padding=(scaled(10, self.scale), scaled(8, self.scale)))
-        style.map("Treeview", background=[("selected", THEME["selection"])], foreground=[("selected", THEME["text"])])
-        style.configure("TNotebook", background=THEME["bg"], borderwidth=0)
-        style.configure("TNotebook.Tab", background=THEME["panel_alt"], foreground=THEME["muted"], padding=(scaled(16, self.scale), scaled(8, self.scale)), font=("Microsoft YaHei UI", base_size))
-        style.map("TNotebook.Tab", background=[("selected", THEME["panel"])], foreground=[("selected", THEME["accent"])])
-        style.configure("TLabelframe", background=THEME["bg"], foreground=THEME["text"], bordercolor=THEME["border"])
-        style.configure("TLabelframe.Label", background=THEME["bg"], foreground=THEME["muted"], font=("Microsoft YaHei UI", title_size, "bold"))
-
-    def center_window(self, width: int = 1100, height: int = 820) -> None:
+    def center_window(self, width: int = 1280, height: int = 860) -> None:
         self.root.update_idletasks()
         width = scaled(width, self.scale)
         height = scaled(height, self.scale)
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
+        width = min(width, screen_width - 40)
+        height = min(height, screen_height - 80)
         x = max(0, (screen_width - width) // 2)
         y = max(0, (screen_height - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
@@ -3284,8 +3680,8 @@ class UtilityToolbox:
         self.window_tree = ttk.Treeview(parent, columns=columns, show="headings", height=18)
         self.window_tree.heading("hwnd", text="窗口句柄")
         self.window_tree.heading("title", text="窗口标题")
-        self.window_tree.column("hwnd", width=scaled(150, self.scale), anchor=tk.CENTER)
-        self.window_tree.column("title", width=scaled(820, self.scale))
+        self.window_tree.column("hwnd", width=scaled(120, self.scale), anchor=tk.CENTER)
+        self.window_tree.column("title", width=scaled(640, self.scale))
         self.window_tree.pack(fill=tk.BOTH, expand=True, pady=(4, 12))
 
         ttk.Label(parent, textvariable=self.status_var).pack(anchor=tk.W)
@@ -3312,8 +3708,8 @@ class UtilityToolbox:
         if next_selection:
             self.window_tree.selection_set(next_selection)
             self.window_tree.focus(next_selection)
-        prefix = "实时检测" if auto else "已刷新"
-        self.set_status(f"{prefix}桌面窗口：{len(self.window_rows)} 个")
+        if not auto:
+            self.set_status(f"已刷新桌面窗口：{len(self.window_rows)} 个")
 
     def schedule_window_refresh(self) -> None:
         if not self.root.winfo_exists():
@@ -3356,11 +3752,18 @@ class UtilityToolbox:
                 self.root.after_cancel(self.window_refresh_job)
             self.backup.stop()
             self.drop_close.stop()
+            launcher = getattr(self, "launcher", None)
+            if launcher is not None:
+                launcher.stop()
             self.topmost.stop()
             self.tray.stop()
         finally:
-            self.save_config()
-            self.root.destroy()
+            try:
+                self.save_config()
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("保存配置失败", f"工具箱将退出，原配置未被覆盖：{exc}", parent=self.root)
+            finally:
+                self.root.destroy()
 
 
 def main() -> int:

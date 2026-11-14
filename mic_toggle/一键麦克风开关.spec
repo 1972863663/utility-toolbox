@@ -6,7 +6,7 @@ source_path = Path(SPECPATH) / '一键麦克风开关.py'
 
 a = Analysis(
     [str(source_path)],
-    pathex=[],
+    pathex=[str(Path(SPECPATH).parent)],
     binaries=[],
     datas=[],
     hiddenimports=[],

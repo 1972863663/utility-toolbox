@@ -34,6 +34,60 @@ class LauncherCloseTests(unittest.TestCase):
 
         self.assertEqual(matches, [(101, processes[0][1]), (202, processes[1][1])])
 
+    def test_group_close_ignores_unrelated_learned_processes(self):
+        app = {
+            "path": r"C:\Games\Runner\game-runner.exe",
+            "close_paths": [
+                r"C:\Games\Runner\game.exe",
+                r"C:\Games\Other\other.exe",
+                r"C:\Windows\System32\conhost.exe",
+            ],
+        }
+        paths = utility_toolbox.launcher_close_paths([app])
+        processes = [
+            (101, r"C:\Games\Runner\game.exe"),
+            (202, r"C:\Games\Runner\unrelated.exe"),
+            (303, r"C:\Games\Other\other.exe"),
+            (404, r"C:\Windows\System32\conhost.exe"),
+        ]
+
+        self.assertEqual(paths, [app["path"], app["close_paths"][0]])
+        self.assertEqual(
+            utility_toolbox.match_processes_for_paths(paths, processes, include_directory_scope=False),
+            [(101, processes[0][1])],
+        )
+
+    def test_group_close_does_not_trust_old_paths_for_regular_apps(self):
+        app = {"path": r"C:\Tools\Editor\editor.exe", "close_paths": [r"C:\Tools\Editor\helper.exe"]}
+        self.assertEqual(utility_toolbox.launcher_close_paths([app]), [app["path"]])
+
+    def test_group_close_does_not_kill_process_trees(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(utility_toolbox.subprocess, "run", return_value=completed) as run, mock.patch.object(
+            utility_toolbox, "_open_process_for_close", side_effect=["handle101", "handle202"]
+        ), mock.patch.object(utility_toolbox, "_wait_for_process_exit", side_effect=[False, False, True, True]), mock.patch.object(
+            utility_toolbox.win32api, "CloseHandle"
+        ):
+            closed, failures = utility_toolbox.terminate_processes_fast([101, 202], include_children=False)
+
+        self.assertEqual(closed, {101, 202})
+        self.assertEqual(failures, {})
+        self.assertEqual(run.call_args.args[0], ["taskkill", "/F", "/PID", "101", "/PID", "202"])
+
+    def test_group_close_fallback_does_not_kill_process_trees(self):
+        failed = mock.Mock(returncode=1, stdout="", stderr="Access is denied.")
+        succeeded = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(utility_toolbox.subprocess, "run", side_effect=[failed, succeeded]) as run, mock.patch.object(
+            utility_toolbox, "_open_process_for_close", return_value="handle101"
+        ), mock.patch.object(utility_toolbox, "_wait_for_process_exit", side_effect=[False, False, True]), mock.patch.object(
+            utility_toolbox.win32api, "CloseHandle"
+        ):
+            closed, failures = utility_toolbox.terminate_processes_fast([101], include_children=False)
+
+        self.assertEqual(closed, {101})
+        self.assertEqual(failures, {})
+        self.assertEqual(run.call_args.args[0], ["taskkill", "/F", "/PID", "101"])
+
     def test_does_not_match_unrelated_processes_next_to_regular_exe(self):
         target = r"C:\Users\User\Desktop\左Shift锁定器.exe"
         processes = [

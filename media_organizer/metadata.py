@@ -31,6 +31,8 @@ def extract_photo_metadata(path: Path) -> tuple[str, str, float | None, float | 
             if not exif:
                 return _date_from_filename(path) or "Unknown-Date", "Unknown-Device", None, None, None
             tags = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+            # Capture timestamps normally live in the Exif IFD, not IFD0.
+            tags.update({ExifTags.TAGS.get(k, k): v for k, v in exif.get_ifd(34665).items()})
             date_raw = tags.get("DateTimeOriginal") or tags.get("DateTime") or tags.get("DateTimeDigitized")
             date = _parse_media_date(date_raw) or _date_from_filename(path) or "Unknown-Date"
             make = str(tags.get("Make") or "").strip()
@@ -155,20 +157,20 @@ def _parse_iso6709(value: str) -> tuple[float, float] | None:
 
 
 def _gps_from_video_binary(path: Path) -> tuple[float | None, float | None]:
+    pattern = re.compile(rb"([+-]\d{2,3}\.\d{3,})([+-]\d{2,3}\.\d{3,})(?:[+-]\d+(?:\.\d+)?)?/")
     try:
-        data = path.read_bytes()
+        with path.open("rb") as stream:
+            tail = b""
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                data = tail + chunk
+                for match in pattern.finditer(data):
+                    lat, lon = float(match.group(1)), float(match.group(2))
+                    if -90 <= lat <= 90 and -180 <= lon <= 180:
+                        return lat, lon
+                # Retain enough context for coordinates split across read blocks.
+                tail = data[-256:]
     except Exception:
         return None, None
-    text = data.decode("latin-1", errors="ignore")
-    match = re.search(r"([+-]\d{2,3}\.\d{3,})([+-]\d{2,3}\.\d{3,})(?:[+-]\d+(?:\.\d+)?)?/", text)
-    if not match:
-        return None, None
-    parsed = _parse_iso6709(match.group(0))
-    if not parsed:
-        return None, None
-    lat, lon = parsed
-    if -90 <= lat <= 90 and -180 <= lon <= 180:
-        return lat, lon
     return None, None
 
 
