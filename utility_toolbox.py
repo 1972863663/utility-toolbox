@@ -289,6 +289,27 @@ def is_process_in_directory(process_path: str, directory_path: str) -> bool:
     return process.startswith(directory + os.sep.casefold())
 
 
+def match_file_owners(paths, processes, protected):
+    from process_file_locks import file_owners, process_started
+    files = [str(Path(path).resolve()) for path in paths
+             if Path(path).suffix.lower() not in PROCESS_EXECUTABLE_EXTENSIONS | PROCESS_SCRIPT_EXTENSIONS
+             and Path(path).is_file()]
+    owners = file_owners(files)
+    matches = []
+    for pid, path in processes:
+        if pid not in owners or is_current_process(pid, path, protected):
+            continue
+        handle = _open_process_for_close(pid, path)
+        if handle is None:
+            continue
+        try:
+            if process_started(handle) == owners[pid] and not _wait_for_process_exit(handle):
+                matches.append((pid, path))
+        finally:
+            win32api.CloseHandle(handle)
+    return matches
+
+
 def match_processes_for_drop_paths(paths: Iterable[str], processes: Iterable[Tuple[int, str]]) -> List[Tuple[int, str]]:
     processes = list(processes)
     file_targets: List[str] = []
@@ -304,6 +325,7 @@ def match_processes_for_drop_paths(paths: Iterable[str], processes: Iterable[Tup
 
     protected = current_process_protected_pids()
     matches = match_processes_for_paths(file_targets, processes, include_directory_scope=False, protected_pids=protected)
+    matches.extend(item for item in match_file_owners(file_targets, processes, protected) if item not in matches)
     if not directory_targets:
         return matches
     seen_pids = {pid for pid, _process_path in matches}
@@ -511,6 +533,7 @@ def observe_closed_process_targets(
             )
             if exact_match or directory_match:
                 remaining.append((pid, process_path))
+        remaining.extend(item for item in match_file_owners(file_targets, snapshot, protected) if item not in remaining)
         if remaining:
             return remaining, process_snapshot_notice(incomplete), False
         budget = deadline - time.monotonic()
@@ -643,6 +666,32 @@ def terminate_processes_fast(
                         except Exception as exc:
                             command_errors[pid] = str(exc)
 
+            if not include_children and expected_paths:
+                for pid in active:
+                    if pid in closed or pid not in command_errors:
+                        continue
+                    native_handle = None
+                    try:
+                        if _wait_for_process_exit(handles[pid]):
+                            closed.add(pid)
+                            continue
+                        native_handle = win32api.OpenProcess(
+                            win32con.PROCESS_TERMINATE | win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE,
+                            False, pid,
+                        )
+                        if normalize_process_path(_process_path_from_handle(native_handle)) != normalize_process_path(expected_paths[pid]):
+                            raise RuntimeError("PID 路径已变化，已跳过原生终止")
+                        # The original retained handle prevents a recycled PID from being mistaken for this process.
+                        if _wait_for_process_exit(handles[pid]):
+                            closed.add(pid)
+                            continue
+                        win32api.TerminateProcess(native_handle, 1)
+                        command_errors.pop(pid, None)
+                    except Exception as exc:
+                        command_errors[pid] = f"{command_errors.get(pid, '')}；原生终止失败：{exc}"
+                    finally:
+                        if native_handle is not None:
+                            win32api.CloseHandle(native_handle)
             exit_deadline = time.monotonic() + PROCESS_EXIT_WAIT_SECONDS
             for pid in active:
                 if pid in closed:
@@ -2892,7 +2941,9 @@ class LauncherTab:
             self._queue_launcher_close(lambda: self._close_worker(launcher_close_paths(apps)))
 
     def close_paths(self, paths: List[str]) -> None:
-        selected = list(paths)
+        entries = self.groups.get(self.current_group, {}).get("apps", []) if getattr(self, "current_group", None) else []
+        by_path = {normalize_process_path(app.get("path", "")): app for app in entries}
+        selected = launcher_close_paths([by_path.get(normalize_process_path(path), {"path": path}) for path in paths])
         self._queue_launcher_close(lambda: self._close_worker(selected))
 
     def stop(self) -> None:
@@ -3107,14 +3158,14 @@ class LauncherTab:
         for error in input_errors:
             self.parent.after(0, lambda e=error: self.log(f"关闭目标失败：{e}"))
         try:
-            targets = [path for path in resolved if Path(path).suffix.lower() in PROCESS_EXECUTABLE_EXTENSIONS]
+            targets = resolved
             if not targets:
                 message = f"当前组没有可按进程关闭的应用{input_error_summary}"
                 self.parent.after(0, lambda m=message: self.log(m))
                 return
             processes = running_process_paths()
             snapshot_notice = process_snapshot_notice(processes)
-            matches = match_processes_for_paths(targets, processes, include_directory_scope=False)
+            matches = match_processes_for_drop_paths(targets, processes)
         except Exception as exc:
             message = f"关闭失败：{exc}{input_error_summary}"
             self.parent.after(0, lambda m=message: self.log(m))
@@ -3143,7 +3194,7 @@ class LauncherTab:
         residual_message = ""
         try:
             remaining, final_notice, cancelled = observe_closed_process_targets(
-                targets, should_stop=lambda: getattr(self, "_close_stopped", False)
+                targets, include_directories=True, should_stop=lambda: getattr(self, "_close_stopped", False)
             )
             if cancelled:
                 return
@@ -3162,13 +3213,15 @@ class LauncherTab:
             message = f"关闭后复查失败：{exc}"
             residual_message = message
             self.parent.after(0, lambda m=message: self.log(m))
-        if input_errors:
-            message = f"关闭完成：已确认退出 {len(closed)} 个，进程失败 {len(failures)} 个{input_error_summary}"
+        if input_errors or failures:
+            failure_detail = f"；{next(iter(failures.values()))}" if failures else ""
+            message = f"关闭完成：已确认退出 {len(closed)} 个，进程失败 {len(failures)} 个{failure_detail}{input_error_summary}"
             if residual_message:
                 message += f"；{residual_message}"
             self.parent.after(0, lambda m=message: self.log(m))
 
     def log(self, message: str) -> None:
+        log_line(f"应用关闭/启动：{message}")
         self.log_text.insert(tk.END, f"[{datetime.now():%H:%M:%S}] {message}\n")
         self.log_text.see(tk.END)
         self.status_callback(message)

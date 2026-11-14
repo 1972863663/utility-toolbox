@@ -9,6 +9,29 @@ from .adapters import TreePort, ListPort, LogPort
 from .widgets import Card, button, label, row, table, log_view
 
 
+class DropCloseCard(Card):
+    def __init__(self, engine):
+        super().__init__("拖到这里直接关闭", "程序 / 快捷方式：关闭对应应用；文件夹：关闭目录内运行的程序；普通文件：结束占用者。")
+        self.engine = engine
+        self.setAcceptDrops(True)
+        self.setToolTip("松手立即执行，不删除文件。请先保存目标应用中的工作。")
+
+    def accepts(self, event):
+        return (not getattr(self.engine, "_launcher_close_pending", False)
+                and event.mimeData().hasUrls()
+                and all(url.isLocalFile() for url in event.mimeData().urls()))
+
+    def dragEnterEvent(self, event):
+        if self.accepts(event):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if self.accepts(event):
+            paths = [url.toLocalFile() for url in event.mimeData().urls()]
+            self.engine.close_paths(paths)
+            event.acceptProposedAction()
+
+
 class LauncherPage(QWidget):
     def __init__(self, backend):
         super().__init__()
@@ -51,6 +74,8 @@ class LauncherPage(QWidget):
         split.setStretchFactor(1, 1)
         split.setSizes([200, 780])
         outer.addWidget(split, 1)
+        self.drop_close = DropCloseCard(self.engine)
+        outer.addWidget(self.drop_close)
         self.log = log_view()
         self.log.setMaximumHeight(125)
         self.log.setPlaceholderText("启动、关闭与路径修复的结果会显示在这里。")
@@ -80,35 +105,38 @@ class LauncherPage(QWidget):
 
     def close_selection(self):
         paths = [self.engine.app_tree.item(token, "values")[2] for token in self.engine.app_tree.selection()]
-        if paths and self.backend.dialogs.askyesno("关闭所选应用", "将关闭以下目标对应的应用，请先保存未保存的工作：\n\n" + "\n".join(paths)):
+        if paths:
             self.engine.close_paths(paths)
 
     def close_current_group(self):
         group = self.engine.current_group
         count = len(self.engine.groups.get(group, {}).get("apps", []))
-        if count and self.backend.dialogs.askyesno("关闭整组应用", f"将关闭「{group}」组内 {count} 个项目对应的应用。\n请确认其中没有未保存的工作。"):
+        if count:
             self.engine.close_current_group()
 
     def sync_state(self):
-        busy = bool(getattr(self.engine, "_launcher_busy", False) or getattr(self.engine, "_launcher_close_pending", False))
+        closing = bool(getattr(self.engine, "_launcher_close_pending", False))
+        busy = bool(getattr(self.engine, "_launcher_busy", False) or closing)
         selected = bool(self.table.selectionModel().selectedRows())
         has_apps = bool(self.engine.groups.get(self.engine.current_group, {}).get("apps", []))
         self.group_title.setText(f"{self.engine.current_group or '未选择分组'} · {self.table.rowCount()} 个项目" + (" · 操作进行中…" if busy else ""))
-        for control in (self.launch_button, self.close_selected, self.remove_button):
+        for control in (self.launch_button, self.remove_button):
             control.setEnabled(selected and not busy)
-        for control in (self.launch_group_button, self.close_group):
-            control.setEnabled(has_apps and not busy)
+        self.launch_group_button.setEnabled(has_apps and not busy)
+        self.close_selected.setEnabled(selected and not closing)
+        self.close_group.setEnabled(has_apps and not closing)
         self.add_button.setEnabled(not busy)
         self.more_button.setEnabled(not busy)
         self.groups.setEnabled(not busy)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() and not getattr(self.engine, "_launcher_busy", False):
+        if event.mimeData().hasUrls() and not (getattr(self.engine, "_launcher_busy", False) or
+                                             getattr(self.engine, "_launcher_close_pending", False)):
             if all(url.isLocalFile() for url in event.mimeData().urls()):
                 event.acceptProposedAction()
 
     def dropEvent(self, event):
-        if not self.engine.current_group:
+        if not self.engine.current_group or getattr(self.engine, "_launcher_busy", False) or getattr(self.engine, "_launcher_close_pending", False):
             return
         paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
         group = self.engine.groups[self.engine.current_group]["apps"]

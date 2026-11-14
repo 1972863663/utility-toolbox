@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QPushButton, QSpinBox, QCheckBox, QK
 from glass_toolbox.backend import core
 from glass_toolbox.hotkeys import SummonHotkey
 from glass_toolbox.widgets import ui_font
+from test_process_close_windows_integration import sleeper_exe
 from test_glass_hotkeys import FakeAPI
 from test_glass_toolbox import application, window, wait_until
 
@@ -117,7 +118,8 @@ def test_launcher_group_add_select_launch_remove_roundtrip(window, application, 
     assert not window.test_errors
 
 
-def test_launcher_close_cancel_does_not_dispatch(window, monkeypatch):
+@pytest.mark.parametrize("kind", ["selection", "group"])
+def test_launcher_close_dispatches_without_confirmation(window, monkeypatch, kind):
     page = window.pages["launcher"]
     page.engine.groups[page.engine.current_group]["apps"] = [{"name": "fixture", "type": "程序", "path": "C:/fake.exe"}]
     page.engine.refresh_apps()
@@ -125,9 +127,16 @@ def test_launcher_close_cancel_does_not_dispatch(window, monkeypatch):
     page.sync_state()
     close = Mock()
     monkeypatch.setattr(page.engine, "close_paths", close)
-    monkeypatch.setattr(window.backend.dialogs, "askyesno", lambda *a: False)
-    page.close_selected.click()
-    close.assert_not_called()
+    group_close = Mock()
+    monkeypatch.setattr(page.engine, "close_current_group", group_close)
+    confirm = Mock(return_value=False)
+    monkeypatch.setattr(window.backend.dialogs, "askyesno", confirm)
+    (page.close_selected if kind == "selection" else page.close_group).click()
+    confirm.assert_not_called()
+    if kind == "selection":
+        close.assert_called_once_with(["C:/fake.exe"])
+    else:
+        group_close.assert_called_once_with()
 
 
 def test_mic_settings_write_only_isolated_config(window, tmp_path, monkeypatch):
@@ -219,3 +228,131 @@ def test_recording_active_hotkey_does_not_hide_window(window, monkeypatch):
     assert window.nativeEvent(b"windows_generic_MSG", ctypes.addressof(message)) == (True, 0)
     assert editor.keySequence().toString(QKeySequence.PortableText) == "Ins"
     assert window.isVisible()
+
+
+@pytest.mark.parametrize("kind", ["selection", "group", "drop-exe", "drop-shortcut", "drop-folder", "drop-multiple", "drop-native-fallback"])
+def test_close_button_ends_real_process_without_touching_same_name_elsewhere(
+        window, application, tmp_path, sleeper_exe, kind, monkeypatch):
+    import shutil
+    import subprocess
+    page = window.pages["launcher"]
+    first, other = tmp_path / "target", tmp_path / "target-other"
+    first.mkdir(); other.mkdir()
+    paths = [folder / sleeper_exe.name for folder in (first, other)]
+    for path in paths:
+        shutil.copy2(sleeper_exe, path)
+    processes = [subprocess.Popen([str(p)], creationflags=subprocess.CREATE_NO_WINDOW) for p in paths]
+    try:
+        page.engine.groups[page.engine.current_group]["apps"] = [
+            {"name": paths[0].name, "type": "程序", "path": str(paths[0])}]
+        page.engine.refresh_apps()
+        page.table.selectRow(0)
+        page.sync_state()
+        if kind.startswith("drop-"):
+            dropped = paths[0]
+            if kind == "drop-shortcut":
+                import pythoncom
+                from win32com.client import Dispatch
+                dropped = tmp_path / "程序快捷方式.lnk"
+                pythoncom.CoInitialize()
+                try:
+                    shortcut = Dispatch("WScript.Shell").CreateShortcut(str(dropped))
+                    shortcut.TargetPath = str(paths[0])
+                    shortcut.Save()
+                    shortcut = None
+                finally:
+                    pythoncom.CoUninitialize()
+            elif kind == "drop-folder":
+                dropped = first
+                helper = first / "bin" / "helper.exe"
+                helper.parent.mkdir()
+                shutil.copy2(sleeper_exe, helper)
+                processes.append(subprocess.Popen([str(helper)], creationflags=subprocess.CREATE_NO_WINDOW))
+            elif kind == "drop-native-fallback":
+                monkeypatch.setattr(core.subprocess, "run", Mock(side_effect=FileNotFoundError("taskkill unavailable")))
+            dropped_paths = [dropped]
+            if kind == "drop-multiple":
+                third = first / "third.exe"
+                shutil.copy2(sleeper_exe, third)
+                processes.append(subprocess.Popen([str(third)], creationflags=subprocess.CREATE_NO_WINDOW))
+                dropped_paths.append(third)
+            send_close_drop(page.drop_close, dropped_paths)
+        else:
+            (page.close_selected if kind == "selection" else page.close_group).click()
+        wait_until(application, lambda: not getattr(page.engine, "_launcher_close_pending", False), timeout=20)
+        assert processes[0].poll() is not None, page.log.toPlainText()
+        assert processes[1].poll() is None
+        if kind in ("drop-multiple", "drop-folder"):
+            assert processes[2].poll() is not None, page.log.toPlainText()
+        assert "失败" not in page.log.toPlainText(), page.log.toPlainText()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+
+def test_drop_close_dispatches_paths_directly_and_never_adds_to_group(window, tmp_path, monkeypatch):
+    from PySide6.QtCore import QMimeData, QUrl, QPointF
+    from PySide6.QtGui import QDropEvent
+    from PySide6.QtCore import Qt
+    page = window.pages["launcher"]
+    before = list(page.engine.groups[page.engine.current_group]["apps"])
+    close = Mock()
+    monkeypatch.setattr(page.engine, "close_paths", close)
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(tmp_path))])
+    event = QDropEvent(QPointF(1, 1), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+    page.drop_close.dropEvent(event)
+    close.assert_called_once()
+    assert [Path(value) for value in close.call_args.args[0]] == [tmp_path]
+    assert event.isAccepted()
+    assert page.engine.groups[page.engine.current_group]["apps"] == before
+
+
+def test_close_remains_available_to_cancel_remaining_launches(window):
+    page = window.pages["launcher"]
+    page.engine.groups[page.engine.current_group]["apps"] = [{"name": "fixture", "type": "程序", "path": "C:/fake.exe"}]
+    page.engine.refresh_apps()
+    page.table.selectRow(0)
+    page.engine._launcher_busy = True
+    try:
+        page.sync_state()
+        assert page.close_selected.isEnabled() and page.close_group.isEnabled()
+        assert not page.launch_button.isEnabled()
+    finally:
+        page.engine._launcher_busy = False
+
+
+def send_close_drop(target, paths):
+    from PySide6.QtCore import QMimeData, QUrl, QPoint, QPointF, Qt
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(path)) for path in paths])
+    enter = QDragEnterEvent(QPoint(10, 10), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(target, enter)
+    assert enter.isAccepted(), "drag enter was rejected"
+    drop = QDropEvent(QPointF(10, 10), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(target, drop)
+    assert drop.isAccepted(), "drop was rejected"
+
+
+@pytest.mark.parametrize("case", ["remote", "pending"])
+def test_drop_close_rejects_remote_paths_and_duplicate_pending_drop(window, monkeypatch, case):
+    from PySide6.QtCore import QMimeData, QUrl, QPoint, Qt
+    from PySide6.QtGui import QDragEnterEvent
+    page = window.pages["launcher"]
+    before = list(page.engine.groups[page.engine.current_group]["apps"])
+    close = Mock()
+    monkeypatch.setattr(page.engine, "close_paths", close)
+    mime = QMimeData()
+    mime.setUrls([QUrl("https://example.invalid/file.exe") if case == "remote" else QUrl.fromLocalFile("C:/fixture.exe")])
+    page.engine._launcher_close_pending = case == "pending"
+    try:
+        enter = QDragEnterEvent(QPoint(10,10), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(page.drop_close, enter)
+        assert not enter.isAccepted()
+        close.assert_not_called()
+        assert page.engine.groups[page.engine.current_group]["apps"] == before
+    finally:
+        page.engine._launcher_close_pending = False
