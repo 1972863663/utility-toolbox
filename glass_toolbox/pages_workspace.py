@@ -11,7 +11,7 @@ from .widgets import Card, button, label, row, table, log_view
 
 class DropCloseCard(Card):
     def __init__(self, engine):
-        super().__init__("拖到这里直接关闭", "程序 / 快捷方式：关闭对应应用；文件夹：关闭目录内运行的程序；普通文件：结束占用者。")
+        super().__init__("窗口任意位置，拖入即关闭", "程序 / 快捷方式：关闭对应应用；文件夹：关闭目录内运行的程序；普通文件：结束占用者。")
         self.engine = engine
         self.setAcceptDrops(True)
         self.setToolTip("松手立即执行，不删除文件。请先保存目标应用中的工作。")
@@ -50,7 +50,7 @@ class LauncherPage(QWidget):
         groups.box.addWidget(self.more_button)
         split.addWidget(groups)
         self.engine.group_list = ListPort(self.groups)
-        apps = Card("分组中的应用", "拖入程序、快捷方式或文件即可添加；双击列表项启动。")
+        apps = Card("分组中的应用", "使用“添加应用”加入分组；双击列表项启动。拖入窗口会直接关闭对应程序。")
         self.group_title = label("", "muted")
         apps.box.addWidget(self.group_title)
         self.table = table(["名称", "类型", "完整路径"], 2)
@@ -130,29 +130,11 @@ class LauncherPage(QWidget):
         self.groups.setEnabled(not busy)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() and not (getattr(self.engine, "_launcher_busy", False) or
-                                             getattr(self.engine, "_launcher_close_pending", False)):
-            if all(url.isLocalFile() for url in event.mimeData().urls()):
-                event.acceptProposedAction()
+        if self.drop_close.accepts(event):
+            event.acceptProposedAction()
 
     def dropEvent(self, event):
-        if not self.engine.current_group or getattr(self.engine, "_launcher_busy", False) or getattr(self.engine, "_launcher_close_pending", False):
-            return
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        group = self.engine.groups[self.engine.current_group]["apps"]
-        existing = {str(Path(item["path"])).casefold() for item in group}
-        added = 0
-        for path in paths:
-            if path.casefold() not in existing:
-                group.append({"name": Path(path).name, "path": path, "type": self.engine.file_type(path)})
-                existing.add(path.casefold())
-                added += 1
-        if added:
-            self.engine.save_config()
-            self.engine.refresh_groups()
-            self.engine.refresh_apps()
-            self.engine.log(f"已添加 {added} 个项目到 {self.engine.current_group}")
-        event.acceptProposedAction()
+        self.drop_close.dropEvent(event)
 
 
 class WindowPage(QWidget):

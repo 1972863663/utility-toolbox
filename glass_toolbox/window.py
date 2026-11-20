@@ -5,7 +5,7 @@ import json
 import os
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QTimer, QRectF, QPoint, QSaveFile, QIODevice
+from PySide6.QtCore import Qt, QTimer, QRectF, QPoint, QSaveFile, QIODevice, QObject, QEvent
 from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QShortcut, QKeySequence, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -72,6 +72,46 @@ class TitleBar(QWidget):
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.toggle_maximized()
+
+
+class WindowDropCloseFilter(QObject):
+    """Route local-file drops before child controls consume them as text or rows."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.owner = window
+        window.setAcceptDrops(True)
+        for child in window.findChildren(QWidget):
+            if child.window() is window:
+                child.setAcceptDrops(True)
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if not isinstance(watched, QWidget) or watched.window() is not self.owner:
+            return False
+        kind = event.type()
+        if kind == QEvent.Polish:
+            watched.setAcceptDrops(True)
+            return False
+        if kind not in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            return False
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return False
+        urls = mime.urls()
+        engine = self.owner.backend.launcher
+        if (not urls or any(not url.isLocalFile() or not url.toLocalFile() for url in urls)
+                or getattr(engine, "_launcher_close_pending", False)
+                or getattr(engine, "_close_stopped", False)
+                or not event.possibleActions() & Qt.CopyAction):
+            event.ignore()
+            return True
+        # Never report a move to Explorer: closing a process must not move/delete its file.
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+        if kind == QEvent.Drop:
+            engine.close_paths(list(dict.fromkeys(url.toLocalFile() for url in urls)))
+        return True
 
 
 class GlassWindow(QWidget):
@@ -148,10 +188,12 @@ class GlassWindow(QWidget):
         content_box.addWidget(self.tabs)
         self.stack = QStackedWidget()
         content_box.addWidget(self.stack, 1)
-        self.status = label("就绪", "muted")
+        self.status = label("拖入文件到窗口任意位置，松手直接关闭对应程序", "muted")
         self.status.setWordWrap(True)
         self.status.setMaximumHeight(48)
-        content_box.addLayout(row(self.status, None, QSizeGrip(self)))
+        status_row = row(self.status, QSizeGrip(self))
+        status_row.setStretch(0, 1)
+        content_box.addLayout(status_row)
         body.addWidget(content, 1)
         outer.addLayout(body, 1)
         self.backend = Backend(self, self.notify)
@@ -189,6 +231,7 @@ class GlassWindow(QWidget):
         available = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1260, available.width() - 40), min(850, available.height() - 40))
         self.move(available.center() - self.rect().center())
+        self.drop_close_filter = WindowDropCloseFilter(self)
 
     def read_settings(self):
         try:
